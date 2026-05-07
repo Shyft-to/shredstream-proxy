@@ -43,6 +43,12 @@ pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 pub const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 
+// Initial-capacity hints for the per-thread packets_with_dest scratch buffer.
+// Sized so typical batches don't trigger reallocations; the Vec grows naturally
+// if a batch ever exceeds this. Cost is O(hint) memory per send thread.
+const PACKETS_PER_BATCH_HINT: usize = 64;
+const MAX_DESTS_HINT: usize = 16;
+
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
 pub fn start_forwarder_threads(
@@ -171,6 +177,13 @@ pub fn start_forwarder_threads(
                         crossbeam_channel::tick(Duration::MAX)
                     };
 
+                    // Reused across batches: holds (packet_data, dest_addr) pairs handed to
+                    // a single sendmmsg-backed batch_send call. Typed as 'static to allow
+                    // capacity reuse across calls; the function transmutes to a call-local
+                    // lifetime, fills, sends, and clears before returning.
+                    let mut packets_with_dest_scratch: Vec<(&'static [u8], &'static SocketAddr)> =
+                        Vec::with_capacity(PACKETS_PER_BATCH_HINT * MAX_DESTS_HINT);
+
                     while !exit.load(Ordering::Relaxed) {
                         crossbeam_channel::select! {
                             // forward packets
@@ -184,6 +197,7 @@ pub fn start_forwarder_threads(
                                     &reconstruct_tx,
                                     debug_trace_shred,
                                     &metrics,
+                                    &mut packets_with_dest_scratch,
                                 );
 
                                 // If the channel is closed or error, break out
@@ -214,6 +228,12 @@ pub fn start_forwarder_threads(
 
 /// Broadcasts the same packet to multiple recipients, parses it into a Shred if possible,
 /// and stores that shred in `all_shreds`.
+///
+/// Fanout is performed via a single `batch_send` call over all (packet, dest)
+/// pairs, so destination count contributes to syscall count only via
+/// `ceil(P*D / UIO_MAXIOV)` rather than D per batch. The `packets_with_dest_scratch`
+/// buffer is owned by the caller and reused across batches to avoid per-batch
+/// allocations.
 #[allow(clippy::too_many_arguments)]
 fn recv_from_channel_and_send_multiple_dest(
     maybe_packet_batch: Result<PacketBatch, RecvError>,
@@ -224,6 +244,7 @@ fn recv_from_channel_and_send_multiple_dest(
     reconstruct_tx: &crossbeam_channel::Sender<PacketBatch>,
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
+    packets_with_dest_scratch: &mut Vec<(&'static [u8], &'static SocketAddr)>,
 ) -> Result<(), ShredstreamProxyError> {
     let packet_batch = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError)?;
     let trace_shred_received_time = SystemTime::now();
@@ -265,39 +286,72 @@ fn recv_from_channel_and_send_multiple_dest(
         });
     });
 
-    // send out to RPCs
-    local_dest_sockets.iter().for_each(|outgoing_socketaddr| {
-        let packets_with_dest = packet_batch_vec[0]
-            .iter()
-            .filter_map(|pkt| {
-                let data = pkt.data(..)?;
-                let addr = outgoing_socketaddr;
-                Some((data, addr))
-            })
-            .collect::<Vec<(&[u8], &SocketAddr)>>();
+    // Reuse the caller-owned scratch buffer. The buffer is typed as
+    // `Vec<(&'static [u8], &'static SocketAddr)>` so its allocation can persist
+    // across calls; we transmute it to a call-local lifetime, fill it, send,
+    // and clear it before returning. The 'static lifetime is purely a phantom
+    // tag to satisfy Rust's invariance on Vec<T>.
+    //
+    // SAFETY: The transmute changes only phantom lifetime parameters of the Vec
+    // contents, not the in-memory representation. We invariantly clear the Vec
+    // at the end of this function (and assert it is empty on entry), so no
+    // call-local references can outlive this stack frame.
+    debug_assert!(
+        packets_with_dest_scratch.is_empty(),
+        "scratch buffer must be empty on entry; caller must not push into it"
+    );
+    let packets_with_dest: &mut Vec<(&[u8], &SocketAddr)> =
+        unsafe { std::mem::transmute(packets_with_dest_scratch) };
 
-        match batch_send(send_socket, &packets_with_dest) {
-            Ok(_) => {
-                metrics
-                    .success_forward
-                    .fetch_add(packets_with_dest.len() as u64, Ordering::Relaxed);
-                metrics.duplicate.fetch_add(num_deduped, Ordering::Relaxed);
-            }
-            Err(SendPktsError::IoError(err, num_failed)) => {
-                metrics
-                    .fail_forward
-                    .fetch_add(packets_with_dest.len() as u64, Ordering::Relaxed);
-                metrics
-                    .duplicate
-                    .fetch_add(num_failed as u64, Ordering::Relaxed);
-                error!(
-                    "Failed to send batch of size {} to {outgoing_socketaddr:?}. \
-                     {num_failed} packets failed. Error: {err}",
-                    packets_with_dest.len()
-                );
+    // Build a single (packet, dest) flat list. sendmmsg packs up to UIO_MAXIOV
+    // (1024 on Linux) iovecs per syscall, so for a typical P=64, D=10 batch the
+    // entire fanout becomes ONE syscall instead of D.
+    let packet_count_before_filter = packet_batch_vec[0].len();
+    for pkt in packet_batch_vec[0].iter() {
+        if let Some(data) = pkt.data(..) {
+            for dest in local_dest_sockets.iter() {
+                packets_with_dest.push((data, dest));
             }
         }
-    });
+    }
+    let pairs_to_send = packets_with_dest.len();
+
+    let send_result = batch_send(send_socket, packets_with_dest);
+
+    // Clear before returning so no call-local refs outlive this frame.
+    packets_with_dest.clear();
+
+    match send_result {
+        Ok(_) => {
+            metrics
+                .success_forward
+                .fetch_add(pairs_to_send as u64, Ordering::Relaxed);
+            // num_deduped is per-batch (not per-destination); count once.
+            // NOTE: this differs from the prior implementation, which incremented
+            // the duplicate counter D times per batch — a multiplicative bug in
+            // the old per-destination loop.
+            metrics
+                .duplicate
+                .fetch_add(num_deduped as u64, Ordering::Relaxed);
+        }
+        Err(SendPktsError::IoError(err, num_failed)) => {
+            metrics
+                .fail_forward
+                .fetch_add(num_failed as u64, Ordering::Relaxed);
+            // Successful sends in a partial-failure case still counted.
+            metrics
+                .success_forward
+                .fetch_add((pairs_to_send.saturating_sub(num_failed)) as u64, Ordering::Relaxed);
+            metrics
+                .duplicate
+                .fetch_add(num_deduped as u64, Ordering::Relaxed);
+            error!(
+                "Failed to fan out batch (packets={packet_count_before_filter}, dests={}, pairs={pairs_to_send}). \
+                 {num_failed} of {pairs_to_send} packet/dest pairs failed. Error: {err}",
+                local_dest_sockets.len()
+            );
+        }
+    }
 
     // Count TraceShred shreds
     if debug_trace_shred {
@@ -606,7 +660,10 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         str::FromStr,
-        sync::{Arc, Mutex, RwLock},
+        sync::{
+            atomic::Ordering,
+            Arc, Mutex, RwLock,
+        },
         thread,
         thread::sleep,
         time::Duration,
@@ -623,32 +680,56 @@ mod tests {
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
         loop {
-            listen_socket.recv(&mut buf).unwrap();
-            received_packets.lock().unwrap().push(Vec::from(buf));
+            match listen_socket.recv(&mut buf) {
+                Ok(_) => received_packets.lock().unwrap().push(Vec::from(buf)),
+                Err(_) => return,
+            }
         }
     }
 
+    /// Build a packet whose data is all `marker` bytes.
+    fn marker_packet(marker: u8, port: u16) -> Packet {
+        Packet::new(
+            [marker; PACKET_DATA_SIZE],
+            Meta {
+                size: PACKET_DATA_SIZE,
+                addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port,
+                flags: PacketFlags::empty(),
+            },
+        )
+    }
+
+    fn fresh_deduper() -> Arc<RwLock<Deduper<2, [u8]>>> {
+        Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
+            &mut rand::thread_rng(),
+            crate::forwarder::DEDUPER_NUM_BITS,
+        )))
+    }
+
+    /// Bind N UDP listener sockets on ephemeral ports, return their addrs and
+    /// shared collectors that the listener threads append into.
+    fn spawn_listeners(num: usize) -> Vec<(SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>)> {
+        let mut out = Vec::with_capacity(num);
+        for _ in 0..num {
+            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+            let addr = sock.local_addr().unwrap();
+            let collector = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let collector_for_thread = collector.clone();
+            thread::spawn(move || listen_and_collect(sock, collector_for_thread));
+            out.push((addr, collector));
+        }
+        out
+    }
+
+    /// Existing test, ported to the new function signature.
+    /// Two shreds, three destinations — every destination must receive both shreds.
     #[test]
     fn test_2shreds_3destinations() {
         let packet_batch = PacketBatch::new(vec![
-            Packet::new(
-                [1; PACKET_DATA_SIZE],
-                Meta {
-                    size: PACKET_DATA_SIZE,
-                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    port: 48289, // received on random port
-                    flags: PacketFlags::empty(),
-                },
-            ),
-            Packet::new(
-                [2; PACKET_DATA_SIZE],
-                Meta {
-                    size: PACKET_DATA_SIZE,
-                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    port: 9999,
-                    flags: PacketFlags::empty(),
-                },
-            ),
+            marker_packet(1, 48289),
+            marker_packet(2, 9999),
         ]);
         let (packet_sender, packet_receiver) = crossbeam_channel::unbounded::<PacketBatch>();
         packet_sender.send(packet_batch).unwrap();
@@ -662,67 +743,300 @@ mod tests {
         let test_listeners = dest_socketaddrs
             .iter()
             .map(|socketaddr| {
-                (
-                    UdpSocket::bind(socketaddr).unwrap(),
-                    *socketaddr,
-                    // store results in vec of packet, where packet is Vec<u8>
-                    Arc::new(Mutex::new(vec![])),
-                )
+                let sock = UdpSocket::bind(socketaddr).unwrap();
+                sock.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+                let collector = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+                let collector_for_thread = collector.clone();
+                thread::spawn(move || listen_and_collect(sock, collector_for_thread));
+                (*socketaddr, collector)
             })
             .collect::<Vec<_>>();
 
         let udp_sender = UdpSocket::bind("0.0.0.0:10000").unwrap();
 
-        // spawn listeners
-        test_listeners
-            .iter()
-            .for_each(|(listen_socket, _socketaddr, to_receive)| {
-                let socket = listen_socket.try_clone().unwrap();
-                let to_receive = to_receive.to_owned();
-                thread::spawn(move || listen_and_collect(socket, to_receive));
-            });
-
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
-        // send packets
+        let mut scratch = Vec::with_capacity(32);
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),
-            &Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
-                &mut rand::thread_rng(),
-                crate::forwarder::DEDUPER_NUM_BITS,
-            ))),
+            &fresh_deduper(),
             &udp_sender,
             &Arc::new(dest_socketaddrs),
             true,
             &reconstruct_tx,
             false,
             &Arc::new(ShredMetrics::default()),
+            &mut scratch,
         )
         .unwrap();
 
-        // allow packets to be received
         sleep(Duration::from_millis(500));
 
-        let received = test_listeners
-            .iter()
-            .map(|(_, _, results)| results.clone())
-            .collect::<Vec<_>>();
-
-        // check results
-        for received in received.iter() {
-            let received = received.lock().unwrap();
-            assert_eq!(received.len(), 2);
-            assert!(received
-                .iter()
-                .all(|packet| packet.len() == PACKET_DATA_SIZE));
+        for (_, results) in test_listeners.iter() {
+            let received = results.lock().unwrap();
+            assert_eq!(received.len(), 2, "each destination should receive both packets");
+            assert!(received.iter().all(|p| p.len() == PACKET_DATA_SIZE));
+            // Order is preserved: packet 1 (marker=1) then packet 2 (marker=2).
             assert_eq!(received[0], [1; PACKET_DATA_SIZE]);
             assert_eq!(received[1], [2; PACKET_DATA_SIZE]);
         }
-
         assert_eq!(
-            received
+            test_listeners
                 .iter()
-                .fold(0, |acc, elem| acc + elem.lock().unwrap().len()),
+                .fold(0, |acc, (_, c)| acc + c.lock().unwrap().len()),
             6
         );
+    }
+
+    /// Fanout correctness with a large destination count: every destination
+    /// must still receive every packet, exercising the single-batch_send path
+    /// across many `(packet, dest)` pairs.
+    #[test]
+    fn test_fanout_many_destinations() {
+        const NUM_DESTS: usize = 12;
+        const NUM_PACKETS: usize = 5;
+
+        let packet_batch = PacketBatch::new(
+            (0..NUM_PACKETS)
+                .map(|i| marker_packet((i as u8) + 10, 7000 + i as u16))
+                .collect(),
+        );
+
+        let listeners = spawn_listeners(NUM_DESTS);
+        let dest_addrs: Vec<SocketAddr> = listeners.iter().map(|(a, _)| *a).collect();
+        let udp_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
+        let metrics = Arc::new(ShredMetrics::default());
+        let mut scratch = Vec::with_capacity(NUM_PACKETS * NUM_DESTS);
+
+        recv_from_channel_and_send_multiple_dest(
+            Ok(packet_batch),
+            &fresh_deduper(),
+            &udp_sender,
+            &dest_addrs,
+            false,
+            &reconstruct_tx,
+            false,
+            &metrics,
+            &mut scratch,
+        )
+        .unwrap();
+
+        sleep(Duration::from_millis(500));
+
+        for (addr, collector) in listeners.iter() {
+            let got = collector.lock().unwrap();
+            assert_eq!(
+                got.len(),
+                NUM_PACKETS,
+                "destination {addr} received {}/{NUM_PACKETS} packets",
+                got.len()
+            );
+            // Per-destination order must match packet send order.
+            for (i, packet) in got.iter().enumerate() {
+                assert_eq!(
+                    packet[0],
+                    (i as u8) + 10,
+                    "destination {addr} got out-of-order packet at index {i}: marker={}",
+                    packet[0]
+                );
+            }
+        }
+
+        // success_forward should equal NUM_PACKETS * NUM_DESTS exactly once
+        // (no per-destination over-counting from the old implementation).
+        assert_eq!(
+            metrics.success_forward.load(Ordering::Relaxed),
+            (NUM_PACKETS * NUM_DESTS) as u64
+        );
+        assert_eq!(metrics.fail_forward.load(Ordering::Relaxed), 0);
+    }
+
+    /// The scratch buffer's allocation must be reused across calls. We verify
+    /// (a) the Vec is empty on entry/exit, (b) capacity does not shrink and
+    /// is reused for a subsequent batch, and (c) deliveries remain correct
+    /// across multiple back-to-back batches.
+    #[test]
+    fn test_scratch_buffer_reused_across_batches() {
+        let listeners = spawn_listeners(4);
+        let dest_addrs: Vec<SocketAddr> = listeners.iter().map(|(a, _)| *a).collect();
+        let udp_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
+        let metrics = Arc::new(ShredMetrics::default());
+        let deduper = fresh_deduper();
+
+        // Pre-allocated capacity hint; we expect this to stay constant.
+        let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> = Vec::with_capacity(64);
+        let initial_capacity = scratch.capacity();
+
+        for round in 0..3u8 {
+            assert!(scratch.is_empty(), "scratch must be empty on entry");
+            let batch = PacketBatch::new(vec![
+                marker_packet(round * 10 + 1, 8001),
+                marker_packet(round * 10 + 2, 8002),
+            ]);
+            recv_from_channel_and_send_multiple_dest(
+                Ok(batch),
+                &deduper,
+                &udp_sender,
+                &dest_addrs,
+                false,
+                &reconstruct_tx,
+                false,
+                &metrics,
+                &mut scratch,
+            )
+            .unwrap();
+            assert!(scratch.is_empty(), "scratch must be empty on exit");
+            assert_eq!(
+                scratch.capacity(),
+                initial_capacity,
+                "capacity must not grow when batch fits in initial capacity"
+            );
+        }
+
+        sleep(Duration::from_millis(500));
+
+        for (_, collector) in listeners.iter() {
+            let got = collector.lock().unwrap();
+            // 3 rounds * 2 packets = 6 packets per destination
+            assert_eq!(got.len(), 6);
+            // First packets of each round: 1, 11, 21
+            assert_eq!(got[0][0], 1);
+            assert_eq!(got[2][0], 11);
+            assert_eq!(got[4][0], 21);
+        }
+
+        // Total successful sends across 3 rounds, 2 packets, 4 destinations.
+        assert_eq!(metrics.success_forward.load(Ordering::Relaxed), 3 * 2 * 4);
+    }
+
+    /// With zero destinations, `batch_send` becomes a no-op and metrics must
+    /// reflect that nothing was sent — but the function must not panic and the
+    /// scratch buffer must be left empty.
+    #[test]
+    fn test_zero_destinations_is_noop() {
+        let udp_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
+        let metrics = Arc::new(ShredMetrics::default());
+        let mut scratch = Vec::with_capacity(8);
+
+        let batch = PacketBatch::new(vec![marker_packet(7, 9001)]);
+        recv_from_channel_and_send_multiple_dest(
+            Ok(batch),
+            &fresh_deduper(),
+            &udp_sender,
+            &[],
+            false,
+            &reconstruct_tx,
+            false,
+            &metrics,
+            &mut scratch,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.received.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.success_forward.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.fail_forward.load(Ordering::Relaxed), 0);
+        assert!(scratch.is_empty());
+    }
+
+    /// A single destination must still receive every packet exactly once and
+    /// the per-destination ordering must hold (sanity check that the new
+    /// flat-list layout iterates packets in order).
+    #[test]
+    fn test_single_destination_preserves_order() {
+        const NUM_PACKETS: usize = 8;
+        let listeners = spawn_listeners(1);
+        let dest_addrs: Vec<SocketAddr> = listeners.iter().map(|(a, _)| *a).collect();
+        let udp_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
+        let metrics = Arc::new(ShredMetrics::default());
+        let mut scratch = Vec::with_capacity(16);
+
+        let batch = PacketBatch::new(
+            (0..NUM_PACKETS)
+                .map(|i| marker_packet(100 + i as u8, 10_000 + i as u16))
+                .collect(),
+        );
+
+        recv_from_channel_and_send_multiple_dest(
+            Ok(batch),
+            &fresh_deduper(),
+            &udp_sender,
+            &dest_addrs,
+            false,
+            &reconstruct_tx,
+            false,
+            &metrics,
+            &mut scratch,
+        )
+        .unwrap();
+
+        sleep(Duration::from_millis(400));
+
+        let got = listeners[0].1.lock().unwrap();
+        assert_eq!(got.len(), NUM_PACKETS);
+        for (i, packet) in got.iter().enumerate() {
+            assert_eq!(packet[0], 100 + i as u8, "out-of-order at index {i}");
+        }
+        assert_eq!(metrics.success_forward.load(Ordering::Relaxed), NUM_PACKETS as u64);
+    }
+
+    /// Scratch buffer that grows beyond its initial capacity on a large batch
+    /// must still produce correct deliveries on the same call and on the next.
+    #[test]
+    fn test_scratch_grows_then_reuses() {
+        let listeners = spawn_listeners(6);
+        let dest_addrs: Vec<SocketAddr> = listeners.iter().map(|(a, _)| *a).collect();
+        let udp_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
+        let metrics = Arc::new(ShredMetrics::default());
+
+        // Intentionally small initial capacity to force a grow on the first batch.
+        let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> = Vec::with_capacity(2);
+
+        let big_batch = PacketBatch::new(
+            (0..10).map(|i| marker_packet(i as u8 + 1, 11_000 + i as u16)).collect(),
+        );
+        recv_from_channel_and_send_multiple_dest(
+            Ok(big_batch),
+            &fresh_deduper(),
+            &udp_sender,
+            &dest_addrs,
+            false,
+            &reconstruct_tx,
+            false,
+            &metrics,
+            &mut scratch,
+        )
+        .unwrap();
+
+        let cap_after_grow = scratch.capacity();
+        assert!(cap_after_grow >= 60, "capacity should have grown to fit 10*6 pairs");
+        assert!(scratch.is_empty(), "scratch must be empty post-call");
+
+        // Second smaller batch should reuse the grown allocation, not shrink.
+        let small_batch = PacketBatch::new(vec![marker_packet(99, 12_000)]);
+        recv_from_channel_and_send_multiple_dest(
+            Ok(small_batch),
+            &fresh_deduper(),
+            &udp_sender,
+            &dest_addrs,
+            false,
+            &reconstruct_tx,
+            false,
+            &metrics,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(scratch.capacity(), cap_after_grow, "capacity must not shrink across calls");
+
+        sleep(Duration::from_millis(500));
+
+        for (_, collector) in listeners.iter() {
+            let got = collector.lock().unwrap();
+            assert_eq!(got.len(), 11, "10 + 1 packets per destination");
+        }
     }
 }
