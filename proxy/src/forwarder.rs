@@ -6,7 +6,7 @@ use std::{
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
@@ -14,7 +14,7 @@ use crossbeam_channel::{Receiver, RecvError};
 use dashmap::DashMap;
 use itertools::Itertools;
 use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, log_enabled, trace, warn, Level};
 use prost::Message;
 use solana_client::client_error::reqwest;
 use solana_ledger::shred::ReedSolomonCache;
@@ -48,6 +48,21 @@ pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 // if a batch ever exceeds this. Cost is O(hint) memory per send thread.
 const PACKETS_PER_BATCH_HINT: usize = 64;
 const MAX_DESTS_HINT: usize = 16;
+
+/// Log target for per-batch latency trace lines. Enable with
+/// `RUST_LOG=shredstream::latency=trace`. Each batch emits one JSON line
+/// prefixed with `LATENCY_TRACE` so log captures can be grep'd and rendered
+/// by an offline HTML viewer.
+pub const LATENCY_TRACE_TARGET: &str = "shredstream::latency";
+
+/// Per-send-thread context for latency tracing. The send thread owns the
+/// counter; the function bumps it on each call. Kept tiny so the hot path
+/// pays only an `Instant::now()` per stage when the trace target is off.
+pub struct LatencyTraceCtx<'a> {
+    pub thread_id: usize,
+    pub batch_seq: &'a mut u64,
+    pub queue_len: usize,
+}
 
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
@@ -184,10 +199,18 @@ pub fn start_forwarder_threads(
                     let mut packets_with_dest_scratch: Vec<(&'static [u8], &'static SocketAddr)> =
                         Vec::with_capacity(PACKETS_PER_BATCH_HINT * MAX_DESTS_HINT);
 
+                    // Per-thread monotonic batch counter for latency trace lines.
+                    // Pairs with `thread_id` to give a globally-unique batch id
+                    // for offline analysis.
+                    let mut batch_seq: u64 = 0;
+
                     while !exit.load(Ordering::Relaxed) {
                         crossbeam_channel::select! {
                             // forward packets
                             recv(packet_receiver) -> maybe_packet_batch => {
+                                // Sample queue depth at receive — proxy for upstream pressure
+                                // since we cannot instrument the streamer recv thread.
+                                let queue_len = packet_receiver.len();
                                 let res = recv_from_channel_and_send_multiple_dest(
                                     maybe_packet_batch,
                                     &deduper,
@@ -198,6 +221,11 @@ pub fn start_forwarder_threads(
                                     debug_trace_shred,
                                     &metrics,
                                     &mut packets_with_dest_scratch,
+                                    LatencyTraceCtx {
+                                        thread_id,
+                                        batch_seq: &mut batch_seq,
+                                        queue_len,
+                                    },
                                 );
 
                                 // If the channel is closed or error, break out
@@ -245,9 +273,20 @@ fn recv_from_channel_and_send_multiple_dest(
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
     packets_with_dest_scratch: &mut Vec<(&'static [u8], &'static SocketAddr)>,
+    latency_ctx: LatencyTraceCtx<'_>,
 ) -> Result<(), ShredstreamProxyError> {
+    // t0: batch is in hand from the channel. Captured unconditionally because
+    // Instant::now() is ~tens of ns; the costlier format/write is gated by
+    // the trace log level on LATENCY_TRACE_TARGET.
+    let t0 = Instant::now();
+    let recv_unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
     let packet_batch = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError)?;
     let trace_shred_received_time = SystemTime::now();
+    let packets_received_in_batch = packet_batch.len();
     metrics
         .received
         .fetch_add(packet_batch.len() as u64, Ordering::Relaxed);
@@ -267,6 +306,8 @@ fn recv_from_channel_and_send_multiple_dest(
         &deduper.read().unwrap(),
         &mut packet_batch_vec,
     );
+    // t1: dedup pass complete. dedup_us = t1 - t0.
+    let t1 = Instant::now();
     // Store stats for each Packet
     packet_batch_vec.iter().for_each(|batch| {
         batch.iter().for_each(|packet| {
@@ -315,8 +356,14 @@ fn recv_from_channel_and_send_multiple_dest(
         }
     }
     let pairs_to_send = packets_with_dest.len();
+    // t2: flat (packet, dest) list built. pack_us = t2 - t1.
+    let t2 = Instant::now();
 
     let send_result = batch_send(send_socket, packets_with_dest);
+    // t3: sendmmsg returned. send_us = t3 - t2.
+    let t3 = Instant::now();
+    // Captured before the match below moves the inner Io error.
+    let send_ok = send_result.is_ok();
 
     // Clear before returning so no call-local refs outlive this frame.
     packets_with_dest.clear();
@@ -351,6 +398,35 @@ fn recv_from_channel_and_send_multiple_dest(
                 local_dest_sockets.len()
             );
         }
+    }
+
+    // Per-batch latency trace. Gated on the dedicated target so the format!
+    // cost is paid only when latency capture is explicitly enabled with
+    // `RUST_LOG=shredstream::latency=trace`. The `LATENCY_TRACE` prefix is
+    // a stable grep anchor for the offline HTML viewer.
+    if log_enabled!(target: LATENCY_TRACE_TARGET, Level::Trace) {
+        let dedup_us = t1.duration_since(t0).as_micros();
+        let pack_us = t2.duration_since(t1).as_micros();
+        let send_us = t3.duration_since(t2).as_micros();
+        let total_us = t3.duration_since(t0).as_micros();
+        *latency_ctx.batch_seq += 1;
+        trace!(
+            target: LATENCY_TRACE_TARGET,
+            "LATENCY_TRACE {{\"batch_seq\":{},\"thread_id\":{},\"queue_len\":{},\"packets\":{},\"dests\":{},\"pairs\":{},\"deduped\":{},\"dedup_us\":{},\"pack_us\":{},\"send_us\":{},\"total_us\":{},\"send_ok\":{},\"recv_unix_ns\":{}}}",
+            *latency_ctx.batch_seq,
+            latency_ctx.thread_id,
+            latency_ctx.queue_len,
+            packets_received_in_batch,
+            local_dest_sockets.len(),
+            pairs_to_send,
+            num_deduped,
+            dedup_us,
+            pack_us,
+            send_us,
+            total_us,
+            send_ok as u8,
+            recv_unix_ns,
+        );
     }
 
     // Count TraceShred shreds
@@ -675,7 +751,18 @@ mod tests {
     };
     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
 
-    use crate::forwarder::{recv_from_channel_and_send_multiple_dest, ShredMetrics};
+    use crate::forwarder::{recv_from_channel_and_send_multiple_dest, LatencyTraceCtx, ShredMetrics};
+
+    /// Test helper: a no-op latency trace context. The trace log target is
+    /// gated by env_logger, so when tests run without `RUST_LOG` set this
+    /// is effectively zero cost.
+    fn noop_ctx(seq: &mut u64) -> LatencyTraceCtx<'_> {
+        LatencyTraceCtx {
+            thread_id: 0,
+            batch_seq: seq,
+            queue_len: 0,
+        }
+    }
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
@@ -756,6 +843,7 @@ mod tests {
 
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
         let mut scratch = Vec::with_capacity(32);
+        let mut seq: u64 = 0;
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),
             &fresh_deduper(),
@@ -766,6 +854,7 @@ mod tests {
             false,
             &Arc::new(ShredMetrics::default()),
             &mut scratch,
+            noop_ctx(&mut seq),
         )
         .unwrap();
 
@@ -808,6 +897,7 @@ mod tests {
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
         let metrics = Arc::new(ShredMetrics::default());
         let mut scratch = Vec::with_capacity(NUM_PACKETS * NUM_DESTS);
+        let mut seq: u64 = 0;
 
         recv_from_channel_and_send_multiple_dest(
             Ok(packet_batch),
@@ -819,6 +909,7 @@ mod tests {
             false,
             &metrics,
             &mut scratch,
+            noop_ctx(&mut seq),
         )
         .unwrap();
 
@@ -867,6 +958,7 @@ mod tests {
 
         // Pre-allocated capacity hint; we expect this to stay constant.
         let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> = Vec::with_capacity(64);
+        let mut seq: u64 = 0;
         let initial_capacity = scratch.capacity();
 
         for round in 0..3u8 {
@@ -885,6 +977,7 @@ mod tests {
                 false,
                 &metrics,
                 &mut scratch,
+                noop_ctx(&mut seq),
             )
             .unwrap();
             assert!(scratch.is_empty(), "scratch must be empty on exit");
@@ -920,6 +1013,7 @@ mod tests {
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
         let metrics = Arc::new(ShredMetrics::default());
         let mut scratch = Vec::with_capacity(8);
+        let mut seq: u64 = 0;
 
         let batch = PacketBatch::new(vec![marker_packet(7, 9001)]);
         recv_from_channel_and_send_multiple_dest(
@@ -932,6 +1026,7 @@ mod tests {
             false,
             &metrics,
             &mut scratch,
+            noop_ctx(&mut seq),
         )
         .unwrap();
 
@@ -953,6 +1048,7 @@ mod tests {
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(1_024);
         let metrics = Arc::new(ShredMetrics::default());
         let mut scratch = Vec::with_capacity(16);
+        let mut seq: u64 = 0;
 
         let batch = PacketBatch::new(
             (0..NUM_PACKETS)
@@ -970,6 +1066,7 @@ mod tests {
             false,
             &metrics,
             &mut scratch,
+            noop_ctx(&mut seq),
         )
         .unwrap();
 
@@ -995,6 +1092,7 @@ mod tests {
 
         // Intentionally small initial capacity to force a grow on the first batch.
         let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> = Vec::with_capacity(2);
+        let mut seq: u64 = 0;
 
         let big_batch = PacketBatch::new(
             (0..10).map(|i| marker_packet(i as u8 + 1, 11_000 + i as u16)).collect(),
@@ -1009,6 +1107,7 @@ mod tests {
             false,
             &metrics,
             &mut scratch,
+            noop_ctx(&mut seq),
         )
         .unwrap();
 
@@ -1028,6 +1127,7 @@ mod tests {
             false,
             &metrics,
             &mut scratch,
+            noop_ctx(&mut seq),
         )
         .unwrap();
         assert_eq!(scratch.capacity(), cap_after_grow, "capacity must not shrink across calls");
