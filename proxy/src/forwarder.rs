@@ -10,7 +10,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, RecvError, TrySendError};
+use crossbeam_channel::{Receiver, RecvError, TryRecvError, TrySendError};
 use dashmap::DashMap;
 use itertools::Itertools;
 use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
@@ -291,8 +291,19 @@ fn run_dest_worker(
 
     let trace_on = log_enabled!(Level::Trace);
 
-    while !exit.load(Ordering::Relaxed) {
-        match rx.recv_timeout(Duration::from_millis(250)) {
+    // STRATEGY 1 — pure busy-spin, no parking.
+    //
+    // The worker never calls `recv_timeout` / `park`, so the coordinator's
+    // `try_send` never has to issue a `FUTEX_WAKE` syscall. Each empty poll
+    // executes `std::hint::spin_loop()` (a CPU PAUSE hint on x86, `yield` on
+    // ARM) and re-tries. The exit flag is checked on every empty iteration so
+    // shutdown is still prompt.
+    //
+    // WARNING: this pins ~1 CPU core per worker at 100 %. With D destinations
+    // active, expect ~D cores burned in steady state regardless of inbound
+    // rate. Make sure the host has the cores to spare before deploying this.
+    loop {
+        match rx.try_recv() {
             Ok(batch) => {
                 debug_assert!(scratch.is_empty());
                 let t_send = trace_on.then(Instant::now);
@@ -345,8 +356,15 @@ fn run_dest_worker(
 
                 drop(batch);
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {
+                // No batch yet. Check exit flag; if not exiting, hint to the
+                // CPU that we're in a tight spin (PAUSE on x86) and re-poll.
+                if exit.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     info!("Exiting dest worker for {}.", *dest_boxed);
