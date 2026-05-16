@@ -277,6 +277,25 @@ const RUNS = [
       { time: "07:55:34Z", batches: 27676, packets: 39784, dest_sends: 795180, avg_total_us: 102, avg_dedup_us: 1, avg_fanout_send_us: 100, avg_max_per_dest_us: null, max_total_us: 2266, max_fanout_send_us: 2223, max_per_dest_us: null },
     ],
   },
+  {
+    name: "Run 6 (2026-05-15) — Strategy 1 busy-spin workers (no parking)",
+    description: "2026-05-15, fra-shred-proxy. Worker-tier architecture unchanged, but `run_dest_worker` switched from `recv_timeout` to a pure busy-spin loop (`try_recv` + `std::hint::spin_loop()`). Workers never park → coordinator's `try_send` no longer issues `FUTEX_WAKE`. Result: avg_fanout_dispatch_us drops from ~30 µs to ~4 µs (~7.5× drop), avg_total_us from ~33 µs to ~7 µs (~4.7× drop). End-to-end (avg_total + avg_worker_send) ~17 µs vs ~39 µs before. WORKLOAD CONFOUND: D rose from 20 → 27 and avg_packets_per_batch from 1 → 2–3; the worker-send rise (6→10µs) is fully explained by P=2 (t_syscall + 2·t_datagram). CPU COST: every worker pins ~1 core at 100% (~27 cores burned steady-state). 9 samples at 10s cadence.",
+    samples: [
+      // time, batches, packets, dest_sends, avg_total_us, avg_dedup_us,
+      // avg_fanout_send_us (= avg_fanout_dispatch_us), avg_max_per_dest_us (null),
+      // max_total_us, max_fanout_send_us (= max_fanout_dispatch_us), max_per_dest_us (null),
+      // avg_worker_send_us, max_worker_send_us, worker_packets_sent
+      { time: "11:43:20Z", batches: 15806, packets: 36979, dest_sends: 426762, avg_total_us: 7, avg_dedup_us: 1, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us:  910, max_fanout_send_us:  833, max_per_dest_us: null, avg_worker_send_us:  9, max_worker_send_us: 6651, worker_packets_sent:  998433 },
+      { time: "11:43:30Z", batches: 13860, packets: 39294, dest_sends: 374220, avg_total_us: 8, avg_dedup_us: 2, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1733, max_fanout_send_us: 1620, max_per_dest_us: null, avg_worker_send_us: 12, max_worker_send_us: 2831, worker_packets_sent: 1060938 },
+      { time: "11:43:40Z", batches: 19084, packets: 39135, dest_sends: 515268, avg_total_us: 7, avg_dedup_us: 1, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1944, max_fanout_send_us:  987, max_per_dest_us: null, avg_worker_send_us:  8, max_worker_send_us: 3775, worker_packets_sent: 1056645 },
+      { time: "11:43:50Z", batches: 16962, packets: 36225, dest_sends: 457974, avg_total_us: 7, avg_dedup_us: 1, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us:  996, max_fanout_send_us:  960, max_per_dest_us: null, avg_worker_send_us:  8, max_worker_send_us: 2520, worker_packets_sent:  978102 },
+      { time: "11:44:00Z", batches:  9950, packets: 33091, dest_sends: 268650, avg_total_us: 9, avg_dedup_us: 3, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1493, max_fanout_send_us: 1329, max_per_dest_us: null, avg_worker_send_us: 13, max_worker_send_us: 4773, worker_packets_sent:  893457 },
+      { time: "11:44:10Z", batches: 16093, packets: 36792, dest_sends: 434511, avg_total_us: 7, avg_dedup_us: 1, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1438, max_fanout_send_us: 1090, max_per_dest_us: null, avg_worker_send_us:  9, max_worker_send_us: 4150, worker_packets_sent:  993384 },
+      { time: "11:44:20Z", batches: 15592, packets: 37760, dest_sends: 420984, avg_total_us: 7, avg_dedup_us: 1, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1091, max_fanout_send_us: 1090, max_per_dest_us: null, avg_worker_send_us: 10, max_worker_send_us: 2888, worker_packets_sent: 1019520 },
+      { time: "11:44:30Z", batches: 14414, packets: 36215, dest_sends: 389178, avg_total_us: 7, avg_dedup_us: 2, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1770, max_fanout_send_us: 1707, max_per_dest_us: null, avg_worker_send_us: 10, max_worker_send_us: 3937, worker_packets_sent:  977805 },
+      { time: "11:44:40Z", batches: 13239, packets: 34210, dest_sends: 357453, avg_total_us: 7, avg_dedup_us: 2, avg_fanout_send_us: 4, avg_max_per_dest_us: null, max_total_us: 1664, max_fanout_send_us: 1650, max_per_dest_us: null, avg_worker_send_us: 11, max_worker_send_us: 3251, worker_packets_sent:  923670 },
+    ],
+  },
   // Add additional runs below. Template:
   // {
   //   name: "Run N (YYYY-MM-DD) — <what changed>",

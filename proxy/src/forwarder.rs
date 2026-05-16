@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
+    collections::HashSet,
+    net::{IpAddr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
@@ -43,20 +43,50 @@ pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 pub const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 pub const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 
-/// Bounded capacity of each per-destination batch channel. When a worker
-/// can't keep up, additional batches are *dropped for that destination only*
-/// (counted in `worker_dropped_batches`). Fast destinations are unaffected.
-const DEST_CHANNEL_CAPACITY: usize = 1024;
-/// Initial scratch-buffer capacity for the per-destination send Vec.
-/// Sized for typical batches; the Vec will grow on demand and stay grown.
-const DEST_SCRATCH_INITIAL_CAPACITY: usize = 128;
-/// How often the dest-manager reconciles workers against the current
-/// `unioned_dest_sockets`.
-const DEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Bounded capacity of each shard's batch channel. A coordinator's `try_send`
+/// drops batches for that one shard (counted in `worker_dropped_batches`)
+/// when full. Other shards keep flowing.
+const SHARD_CHANNEL_CAPACITY: usize = 1024;
+/// Initial scratch-buffer capacity per shard for the flat (packet, dest)
+/// Vec. Sized so a typical batch (P × (D/N) pairs) fits without growing.
+const SHARD_SCRATCH_INITIAL_CAPACITY: usize = 256;
+/// How often the shard manager re-distributes the destination set across
+/// the (fixed) shard threads.
+const SHARD_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// One channel per active destination. Coordinator threads load a snapshot
-/// of this map and dispatch `Arc<PacketBatch>` to each sender.
-pub type DestSenderMap = HashMap<SocketAddr, crossbeam_channel::Sender<Arc<PacketBatch>>>;
+/// Clamp on the number of busy-spinning send-shard threads. N is fixed at
+/// startup based on `available_parallelism()`; only the per-shard
+/// destination ASSIGNMENT changes when D changes.
+const MIN_SEND_SHARDS: usize = 2;
+const MAX_SEND_SHARDS: usize = 16;
+
+/// Pick a sensible shard count from available CPU parallelism. N must be
+/// small enough not to over-burn cores (each shard busy-spins) but large
+/// enough to keep per-shard `(D/N) × t_datagram` work bounded.
+fn compute_send_shards() -> usize {
+    let par = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8);
+    (par / 4).clamp(MIN_SEND_SHARDS, MAX_SEND_SHARDS)
+}
+
+/// Snapshot of the N shard channel senders, published once at startup.
+/// Coordinators load this and dispatch each `Arc<PacketBatch>` to all N
+/// shards.
+pub type ShardSenderList = Vec<crossbeam_channel::Sender<Arc<PacketBatch>>>;
+
+/// Handle held by the shard manager — owns the destination assignment
+/// (mutated on reconcile), the channel sender, and the thread join.
+struct ShardHandle {
+    /// Current destination slice assigned to this shard. Updated by the
+    /// manager on reconcile; read by the shard thread on every batch via
+    /// an `ArcSwap` load (lock-free, cheap).
+    assignment: Arc<ArcSwap<Vec<SocketAddr>>>,
+    /// Channel sender for feeding batches to the shard.
+    sender: crossbeam_channel::Sender<Arc<PacketBatch>>,
+    /// Join handle for the shard thread.
+    join: JoinHandle<()>,
+}
 
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
@@ -146,22 +176,23 @@ pub fn start_forwarder_threads(
         thread_hdls.push(hdl);
     };
 
-    // Shared snapshot of (dest -> channel-sender-to-worker). Coordinator
-    // threads load this and dispatch each Arc<PacketBatch>. The dest-manager
-    // thread (below) is the only writer; coordinators are readers.
-    let dest_senders: Arc<ArcSwap<DestSenderMap>> =
-        Arc::new(ArcSwap::from_pointee(DestSenderMap::default()));
+    // Published snapshot of the N shard channel senders. Filled in by the
+    // shard manager once N shards have been spawned; never re-published
+    // after that (N is fixed). Coordinators dispatch each `Arc<PacketBatch>`
+    // to all N senders.
+    let shard_senders: Arc<ArcSwap<ShardSenderList>> =
+        Arc::new(ArcSwap::from_pointee(ShardSenderList::default()));
 
-    // Spawn the dest manager. It reconciles `dest_senders` against
-    // `unioned_dest_sockets` and owns the worker join handles.
-    let dest_mgr_hdl = start_dest_manager_thread(
+    // Spawn the shard manager. It spawns N busy-spinning send-shard threads
+    // and periodically re-distributes `unioned_dest_sockets` across them.
+    let shard_mgr_hdl = start_shard_manager_thread(
         unioned_dest_sockets.clone(),
-        dest_senders.clone(),
+        shard_senders.clone(),
         metrics.clone(),
         shutdown_receiver.clone(),
         exit.clone(),
     );
-    thread_hdls.push(dest_mgr_hdl);
+    thread_hdls.push(shard_mgr_hdl);
 
     sockets
         .into_iter()
@@ -187,7 +218,7 @@ pub fn start_forwarder_threads(
             let shutdown_receiver = shutdown_receiver.clone();
             let reconstruct_tx = reconstruct_tx.clone();
             let exit = exit.clone();
-            let dest_senders = dest_senders.clone();
+            let shard_senders = shard_senders.clone();
 
             let send_thread = Builder::new()
                 .name(format!("ssPxyTx_{thread_id}"))
@@ -199,7 +230,7 @@ pub fn start_forwarder_threads(
                                 let res = recv_from_channel_and_send_multiple_dest(
                                     maybe_packet_batch,
                                     &deduper,
-                                    &dest_senders,
+                                    &shard_senders,
                                     should_reconstruct_shreds,
                                     &reconstruct_tx,
                                     debug_trace_shred,
@@ -238,70 +269,77 @@ pub fn start_forwarder_threads(
 ///
 /// Each received `Arc<PacketBatch>` is sent in a single `batch_send` call,
 /// which is `sendmmsg(2)` on Linux (one syscall for up to 1024 packets).
-fn spawn_dest_worker(
-    dest: SocketAddr,
+/// Spawn one busy-spinning send-shard thread. Returns a `ShardHandle`
+/// holding the assignment ArcSwap, the channel sender, and the join handle.
+///
+/// The shard owns ONE `UdpSocket` (IPv4) used to issue one `batch_send`
+/// (`sendmmsg`) per incoming batch over all `(packet, dest)` pairs in its
+/// current assignment.
+fn spawn_send_shard(
+    shard_id: usize,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
-) -> (crossbeam_channel::Sender<Arc<PacketBatch>>, JoinHandle<()>) {
-    let (tx, rx) = crossbeam_channel::bounded::<Arc<PacketBatch>>(DEST_CHANNEL_CAPACITY);
-    // Box the destination so its address is stable for the lifetime of the
-    // thread — references into it can safely be transmuted to 'static.
-    let dest_boxed: Box<SocketAddr> = Box::new(dest);
-    let bind_addr = match dest {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    };
-    let name = format!("ssPxyDst_{}_{}", dest.ip(), dest.port());
-    let hdl = Builder::new()
+) -> ShardHandle {
+    let (tx, rx) = crossbeam_channel::bounded::<Arc<PacketBatch>>(SHARD_CHANNEL_CAPACITY);
+    let assignment: Arc<ArcSwap<Vec<SocketAddr>>> =
+        Arc::new(ArcSwap::from_pointee(Vec::new()));
+    let assignment_for_thread = assignment.clone();
+    let name = format!("ssPxyShard_{shard_id}");
+    let join = Builder::new()
         .name(name)
-        .spawn(move || run_dest_worker(dest_boxed, bind_addr, rx, metrics, exit))
-        .expect("failed to spawn dest worker thread");
-    (tx, hdl)
+        .spawn(move || run_send_shard(shard_id, assignment_for_thread, rx, metrics, exit))
+        .expect("failed to spawn send-shard thread");
+    ShardHandle {
+        assignment,
+        sender: tx,
+        join,
+    }
 }
 
-/// The body of a per-destination worker thread.
-fn run_dest_worker(
-    dest_boxed: Box<SocketAddr>,
-    bind_addr: SocketAddr,
+/// The body of a busy-spinning send-shard thread.
+///
+/// Each batch:
+///   1. Load the current destination assignment (ArcSwap, lock-free).
+///   2. Build a flat `Vec<(&[u8], &SocketAddr)>` of `P × (D/N)` pairs.
+///   3. Issue one `batch_send` (= `sendmmsg`) covering the whole shard.
+///   4. Clear scratch and loop.
+///
+/// STRATEGY 1 (no parking) is preserved: the shard polls via `try_recv` +
+/// `std::hint::spin_loop()`. Empty polls cost ~zero kernel work.
+///
+/// WARNING: each shard pins ~1 CPU core at ~100 %. With N shards that's N
+/// cores burned steady-state. N is fixed at startup from
+/// `available_parallelism()` — see `compute_send_shards`.
+fn run_send_shard(
+    shard_id: usize,
+    assignment: Arc<ArcSwap<Vec<SocketAddr>>>,
     rx: crossbeam_channel::Receiver<Arc<PacketBatch>>,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
 ) {
-    let socket = match UdpSocket::bind(bind_addr) {
+    // Bind one IPv4 sending socket per shard. (Solana TVU destinations are
+    // IPv4 in practice; v6 dests in the assignment will be skipped with a
+    // warning at first sight.)
+    let socket = match UdpSocket::bind(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        0,
+    )) {
         Ok(s) => s,
         Err(e) => {
-            error!("dest worker for {} failed to bind: {e}", *dest_boxed);
+            error!("shard {shard_id} failed to bind send socket: {e}");
             return;
         }
     };
 
-    // Reused scratch: (&packet_data, &dest_addr). The 'static lifetime is a
-    // *phantom* — see SAFETY notes at each push. We `clear()` before every
-    // function exit, so no reference outlives its source.
+    // Reused scratch — see SAFETY notes inside the hot loop. We `clear()`
+    // before every iteration boundary so no transmuted 'static reference
+    // escapes the function.
     let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> =
-        Vec::with_capacity(DEST_SCRATCH_INITIAL_CAPACITY);
-
-    // Stable pointer to the destination — Box keeps it pinned for the
-    // lifetime of this thread.
-    let dest_ref: &SocketAddr = &dest_boxed;
-    // SAFETY: dest_ref lives as long as this thread; this transmute extends
-    // its lifetime to 'static for storage purposes only. The Vec is cleared
-    // before the function returns.
-    let dest_static: &'static SocketAddr = unsafe { std::mem::transmute(dest_ref) };
+        Vec::with_capacity(SHARD_SCRATCH_INITIAL_CAPACITY);
 
     let trace_on = log_enabled!(Level::Trace);
+    let mut warned_v6 = false;
 
-    // STRATEGY 1 — pure busy-spin, no parking.
-    //
-    // The worker never calls `recv_timeout` / `park`, so the coordinator's
-    // `try_send` never has to issue a `FUTEX_WAKE` syscall. Each empty poll
-    // executes `std::hint::spin_loop()` (a CPU PAUSE hint on x86, `yield` on
-    // ARM) and re-tries. The exit flag is checked on every empty iteration so
-    // shutdown is still prompt.
-    //
-    // WARNING: this pins ~1 CPU core per worker at 100 %. With D destinations
-    // active, expect ~D cores burned in steady state regardless of inbound
-    // rate. Make sure the host has the cores to spare before deploying this.
     loop {
         match rx.try_recv() {
             Ok(batch) => {
@@ -309,35 +347,61 @@ fn run_dest_worker(
                 let t_send = trace_on.then(Instant::now);
                 let batch_packet_count = batch.len();
 
+                // Snapshot the current destination assignment for this batch.
+                // `dests` is an `arc_swap::Guard<Arc<Vec<SocketAddr>>>` and
+                // outlives the scratch fill + send below.
+                let dests = assignment.load();
+
+                if !warned_v6 && dests.iter().any(|d| matches!(d, SocketAddr::V6(_))) {
+                    warn!(
+                        "shard {shard_id} has IPv6 destination(s) in its assignment; \
+                         only IPv4 dests will be sent (shard socket is IPv4-only)."
+                    );
+                    warned_v6 = true;
+                }
+
                 for pkt in batch.iter() {
                     if let Some(data) = pkt.data(..) {
-                        // SAFETY: `data` borrows from `batch`, which is held
-                        // for the duration of this loop iteration. We clear
-                        // `scratch` before this iteration ends, so the
-                        // transmuted 'static reference never escapes.
-                        let data_static: &'static [u8] = unsafe { std::mem::transmute(data) };
-                        scratch.push((data_static, dest_static));
+                        // SAFETY: `data` borrows from `batch`, held for this
+                        // loop iteration. `scratch.clear()` runs before this
+                        // iteration ends — no transmuted ref escapes.
+                        let data_static: &'static [u8] =
+                            unsafe { std::mem::transmute(data) };
+                        for dest in dests.iter() {
+                            if matches!(dest, SocketAddr::V6(_)) {
+                                continue;
+                            }
+                            // SAFETY: `dest` borrows from the loaded
+                            // `assignment` Guard, held for this iteration.
+                            // Cleared with the scratch before iteration end.
+                            let dest_static: &'static SocketAddr =
+                                unsafe { std::mem::transmute(dest) };
+                            scratch.push((data_static, dest_static));
+                        }
                     }
                 }
 
                 let to_send = scratch.len() as u64;
-                match batch_send(&socket, &scratch) {
-                    Ok(()) => {
-                        metrics
-                            .success_forward
-                            .fetch_add(to_send, Ordering::Relaxed);
-                    }
-                    Err(SendPktsError::IoError(err, num_failed)) => {
-                        metrics
-                            .fail_forward
-                            .fetch_add(num_failed as u64, Ordering::Relaxed);
-                        metrics
-                            .success_forward
-                            .fetch_add(to_send.saturating_sub(num_failed as u64), Ordering::Relaxed);
-                        error!(
-                            "dest worker for {} failed batch of {to_send}: {num_failed} failed. Error: {err}",
-                            *dest_boxed
-                        );
+                if to_send > 0 {
+                    match batch_send(&socket, &scratch) {
+                        Ok(()) => {
+                            metrics
+                                .success_forward
+                                .fetch_add(to_send, Ordering::Relaxed);
+                        }
+                        Err(SendPktsError::IoError(err, num_failed)) => {
+                            metrics
+                                .fail_forward
+                                .fetch_add(num_failed as u64, Ordering::Relaxed);
+                            metrics.success_forward.fetch_add(
+                                to_send.saturating_sub(num_failed as u64),
+                                Ordering::Relaxed,
+                            );
+                            error!(
+                                "shard {shard_id} failed batch of {to_send}: \
+                                 {num_failed} failed. Error: {err}"
+                            );
+                        }
                     }
                 }
                 scratch.clear();
@@ -357,8 +421,6 @@ fn run_dest_worker(
                 drop(batch);
             }
             Err(TryRecvError::Empty) => {
-                // No batch yet. Check exit flag; if not exiting, hint to the
-                // CPU that we're in a tight spin (PAUSE on x86) and re-poll.
                 if exit.load(Ordering::Relaxed) {
                     break;
                 }
@@ -367,115 +429,121 @@ fn run_dest_worker(
             Err(TryRecvError::Disconnected) => break,
         }
     }
-    info!("Exiting dest worker for {}.", *dest_boxed);
-    // scratch is dropped here — it's already empty.
+    info!("Exiting send shard {shard_id}.");
 }
 
-/// Reconciles per-destination worker threads against the current set of
-/// destinations published in `unioned_dest_sockets`. Spawns new workers when
-/// destinations appear, drops senders when destinations are removed (which
-/// causes the worker thread to exit on channel disconnect).
-fn start_dest_manager_thread(
+/// Spawns the N busy-spinning send-shard threads ONCE at startup, then
+/// loops on a tick: every `SHARD_RECONCILE_INTERVAL`, re-distributes the
+/// current `unioned_dest_sockets` across the N shards (round-robin) via
+/// each shard's per-thread `assignment` `ArcSwap`.
+///
+/// N is fixed for the lifetime of the process — see `compute_send_shards`.
+/// Only the per-shard destination ASSIGNMENT changes when D changes.
+fn start_shard_manager_thread(
     unioned_dest_sockets: Arc<ArcSwap<Vec<SocketAddr>>>,
-    dest_senders: Arc<ArcSwap<DestSenderMap>>,
+    shard_senders: Arc<ArcSwap<ShardSenderList>>,
     metrics: Arc<ShredMetrics>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     Builder::new()
-        .name("ssPxyDstMgr".to_string())
+        .name("ssPxyShardMgr".to_string())
         .spawn(move || {
-            let tick = crossbeam_channel::tick(DEST_RECONCILE_INTERVAL);
-            // Owned handles & senders, kept in sync with the published map.
-            // We hold senders here so they outlive any in-flight broadcast
-            // until the worker has fully drained.
-            let mut handles: HashMap<SocketAddr, JoinHandle<()>> = HashMap::new();
-            let mut owned: DestSenderMap = DestSenderMap::default();
-
-            // Run one reconciliation immediately so workers exist before the
-            // first packet arrives.
-            reconcile_dest_workers(
-                &unioned_dest_sockets,
-                &dest_senders,
-                &mut owned,
-                &mut handles,
-                &metrics,
-                &exit,
+            let available_cores = std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(0);
+            let num_shards = compute_send_shards();
+            info!(
+                "Send-shard pool: spawning N={num_shards} busy-spinning send \
+                 shards on a host with {available_cores} available cores \
+                 (clamped between MIN={MIN_SEND_SHARDS} and MAX={MAX_SEND_SHARDS}). \
+                 Each shard pins ~1 core at 100% — total expected steady-state \
+                 spin burn: ~{num_shards} cores."
             );
 
+            // Spawn N shard threads. The thread count is fixed for the
+            // lifetime of the process; D changes are absorbed by re-sharding
+            // the assignment.
+            let mut shards: Vec<ShardHandle> = (0..num_shards)
+                .map(|i| spawn_send_shard(i, metrics.clone(), exit.clone()))
+                .collect();
+
+            // Publish the senders snapshot once. It never changes again until
+            // shutdown.
+            let senders_snapshot: ShardSenderList =
+                shards.iter().map(|s| s.sender.clone()).collect();
+            shard_senders.store(Arc::new(senders_snapshot));
+
+            // Initial assignment so shards have something to serve before the
+            // first tick.
+            reshard_assignments(&unioned_dest_sockets, &shards, &metrics);
+
+            let tick = crossbeam_channel::tick(SHARD_RECONCILE_INTERVAL);
             while !exit.load(Ordering::Relaxed) {
                 crossbeam_channel::select! {
                     recv(tick) -> _ => {
-                        reconcile_dest_workers(
+                        reshard_assignments(
                             &unioned_dest_sockets,
-                            &dest_senders,
-                            &mut owned,
-                            &mut handles,
+                            &shards,
                             &metrics,
-                            &exit,
                         );
                     }
                     recv(shutdown_receiver) -> _ => break,
                 }
             }
 
-            // Shutdown: drop all senders so workers see Disconnected and exit.
-            drop(owned);
-            dest_senders.store(Arc::new(DestSenderMap::default()));
-            for (dest, h) in handles.drain() {
+            // Shutdown: drop the published sender snapshot so coordinators
+            // stop dispatching, then drop each shard's sender so the shard
+            // thread sees `Disconnected` (its busy-spin loop breaks).
+            shard_senders.store(Arc::new(ShardSenderList::default()));
+            let join_handles: Vec<JoinHandle<()>> = shards
+                .drain(..)
+                .map(|s| {
+                    drop(s.sender);
+                    s.join
+                })
+                .collect();
+            for (i, h) in join_handles.into_iter().enumerate() {
                 if let Err(e) = h.join() {
-                    warn!("dest worker {dest} join failed: {e:?}");
+                    warn!("send shard {i} join failed: {e:?}");
                 }
             }
-            info!("Exiting dest manager.");
+            info!("Exiting shard manager.");
         })
         .unwrap()
 }
 
-fn reconcile_dest_workers(
+/// Re-distribute the current destination set across the fixed N shards
+/// (round-robin). Each shard's `ArcSwap<Vec<SocketAddr>>` is replaced in
+/// one atomic store — shard threads pick up the new slice on the next
+/// batch via a lock-free `load()`.
+///
+/// Also updates the published `worker_count` metric. Note that
+/// `worker_count` now means **destination count** (D), not shard count;
+/// it's kept under the same field name for dashboard continuity.
+fn reshard_assignments(
     unioned_dest_sockets: &ArcSwap<Vec<SocketAddr>>,
-    dest_senders: &ArcSwap<DestSenderMap>,
-    owned: &mut DestSenderMap,
-    handles: &mut HashMap<SocketAddr, JoinHandle<()>>,
+    shards: &[ShardHandle],
     metrics: &Arc<ShredMetrics>,
-    exit: &Arc<AtomicBool>,
 ) {
     let desired = unioned_dest_sockets.load();
-    let desired_set: HashSet<SocketAddr> = desired.iter().copied().collect();
+    let n = shards.len();
 
-    // Remove workers whose destination is gone.
-    let to_remove: Vec<SocketAddr> = owned
-        .keys()
-        .filter(|d| !desired_set.contains(d))
-        .copied()
-        .collect();
-    for dest in to_remove {
-        owned.remove(&dest);
-        // Don't join yet — the worker thread may still be draining. It will
-        // exit on Disconnected; we'll join on shutdown.
-        if let Some(h) = handles.remove(&dest) {
-            // Detach: the JoinHandle is dropped, which is fine — Rust threads
-            // continue running. The thread will see channel disconnect and exit.
-            drop(h);
-        }
-        info!("dest worker removed: {dest}");
+    // Round-robin shard i gets dests[i], dests[i+n], dests[i+2n], …
+    // Spreads heterogeneous destinations across shards better than
+    // contiguous slicing.
+    let mut buckets: Vec<Vec<SocketAddr>> = (0..n).map(|_| Vec::new()).collect();
+    for (idx, dest) in desired.iter().enumerate() {
+        buckets[idx % n].push(*dest);
     }
 
-    // Spawn workers for new destinations.
-    for dest in desired_set.iter() {
-        if !owned.contains_key(dest) {
-            let (tx, hdl) = spawn_dest_worker(*dest, metrics.clone(), exit.clone());
-            owned.insert(*dest, tx);
-            handles.insert(*dest, hdl);
-            info!("dest worker spawned: {dest}");
-        }
+    for (shard, bucket) in shards.iter().zip(buckets) {
+        shard.assignment.store(Arc::new(bucket));
     }
 
-    // Publish a fresh snapshot to coordinators.
-    dest_senders.store(Arc::new(owned.clone()));
     metrics
         .worker_count
-        .store(owned.len(), Ordering::Relaxed);
+        .store(desired.len(), Ordering::Relaxed);
 }
 
 /// Lock-free monotonic max update.
@@ -500,7 +568,7 @@ fn update_max_atomic(cell: &AtomicU64, val: u64) {
 fn recv_from_channel_and_send_multiple_dest(
     maybe_packet_batch: Result<PacketBatch, RecvError>,
     deduper: &RwLock<Deduper<2, [u8]>>,
-    dest_senders: &ArcSwap<DestSenderMap>,
+    shard_senders: &ArcSwap<ShardSenderList>,
     should_reconstruct_shreds: bool,
     reconstruct_tx: &crossbeam_channel::Sender<PacketBatch>,
     debug_trace_shred: bool,
@@ -572,10 +640,14 @@ fn recv_from_channel_and_send_multiple_dest(
     let arc_batch = Arc::new(packet_batch);
 
     let t_before_fanout = mark();
-    let senders_snapshot = dest_senders.load();
+    let senders_snapshot = shard_senders.load();
+    // num_dest here means "fan-out targets the coordinator wakes per batch".
+    // With Strategy 3 that's N shards, not D destinations — the actual
+    // (packet × destination) UDP send count is tracked downstream via
+    // success_forward / fail_forward in each shard thread.
     let num_dest = senders_snapshot.len() as u64;
     let mut dropped: u64 = 0;
-    for sender in senders_snapshot.values() {
+    for sender in senders_snapshot.iter() {
         match sender.try_send(arc_batch.clone()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => dropped += 1,
@@ -1099,7 +1171,7 @@ mod tests {
     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
 
     use crate::forwarder::{
-        recv_from_channel_and_send_multiple_dest, spawn_dest_worker, DestSenderMap, ShredMetrics,
+        recv_from_channel_and_send_multiple_dest, spawn_send_shard, ShardSenderList, ShredMetrics,
     };
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
@@ -1162,18 +1234,17 @@ mod tests {
                 thread::spawn(move || listen_and_collect(socket, to_receive));
             });
 
-        // Spawn one worker per destination and build the dest_senders snapshot
-        // the same way the dest manager would in production.
+        // Spawn ONE send shard, assign all 3 dests to it (so the shard
+        // fans out to all of them in one batch_send), and publish the
+        // sender snapshot.
         let metrics = Arc::new(ShredMetrics::default());
         let exit = Arc::new(AtomicBool::new(false));
-        let mut map = DestSenderMap::default();
-        let mut worker_handles = Vec::new();
-        for dest in &dest_socketaddrs {
-            let (tx, hdl) = spawn_dest_worker(*dest, metrics.clone(), exit.clone());
-            map.insert(*dest, tx);
-            worker_handles.push(hdl);
-        }
-        let dest_senders = ArcSwap::from_pointee(map);
+        let shard = spawn_send_shard(0, metrics.clone(), exit.clone());
+        shard
+            .assignment
+            .store(Arc::new(dest_socketaddrs.clone()));
+        let shard_senders: ShardSenderList = vec![shard.sender.clone()];
+        let shard_senders = ArcSwap::from_pointee(shard_senders);
 
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
         recv_from_channel_and_send_multiple_dest(
@@ -1182,7 +1253,7 @@ mod tests {
                 &mut rand::thread_rng(),
                 crate::forwarder::DEDUPER_NUM_BITS,
             ))),
-            &dest_senders,
+            &shard_senders,
             true,
             &reconstruct_tx,
             false,
@@ -1216,12 +1287,12 @@ mod tests {
             6
         );
 
-        // Signal workers to exit and join.
+        // Signal the shard to exit and join it. Drop both sender copies so
+        // its `try_recv` sees `Disconnected` (the exit flag also breaks the
+        // busy-spin loop independently).
         exit.store(true, Ordering::Relaxed);
-        // Drop senders so workers see Disconnected if they're between recv timeouts.
-        drop(dest_senders);
-        for h in worker_handles {
-            h.join().unwrap();
-        }
+        drop(shard_senders);
+        drop(shard.sender);
+        shard.join.join().unwrap();
     }
 }
