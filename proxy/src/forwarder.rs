@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, RecvError, TryRecvError, TrySendError};
 use dashmap::DashMap;
 use itertools::Itertools;
 use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
-use log::{error, info, log_enabled, warn, Level};
+use log::{debug, error, info, log_enabled, warn, Level};
 use prost::Message;
 use solana_client::client_error::reqwest;
 use solana_ledger::shred::ReedSolomonCache;
@@ -393,6 +393,18 @@ fn run_send_shard(
 
     let trace_on = log_enabled!(Level::Trace);
 
+    // Tracks whether this shard has already logged a one-shot WARN for
+    // send failures. With connected UDP sockets the kernel surfaces ICMP
+    // "port unreachable" / "host unreachable" responses on the NEXT send()
+    // — these show up as ECONNREFUSED/EHOSTUNREACH and are normal background
+    // noise for any destination set that contains dead targets (the
+    // unconnected-socket code silently swallowed them via sendto, which
+    // never reads the ICMP error queue). We surface the FIRST failure per
+    // shard at WARN so operators have a breadcrumb, then drop subsequent
+    // per-batch reports to DEBUG. The `fail_forward` counter remains the
+    // authoritative count of dropped (packet, dest) pairs.
+    let mut warned_send_failure = false;
+
     loop {
         match rx.try_recv() {
             Ok((batch, trace)) => {
@@ -460,10 +472,28 @@ fn run_send_shard(
                         .fail_forward
                         .fetch_add(total_failed, Ordering::Relaxed);
                     if let Some(e) = first_err {
-                        error!(
-                            "shard {shard_id} send failures: {total_failed} \
-                             packets across {n_dests} dests. First error: {e}"
-                        );
+                        // First failure on this shard: one-shot WARN so it's
+                        // visible without spamming. ECONNREFUSED / EHOSTUNREACH
+                        // are the common ones — ICMP responses delivered via
+                        // the connected socket; the dest is genuinely dead.
+                        // The `fail_forward` counter is the authoritative
+                        // count of dropped (packet, dest) pairs.
+                        if !warned_send_failure {
+                            warn!(
+                                "shard {shard_id} first send failures: \
+                                 {total_failed} packets across {n_dests} \
+                                 dests. First error: {e}. Subsequent \
+                                 failures logged at DEBUG; see \
+                                 `fail_forward` metric for the count."
+                            );
+                            warned_send_failure = true;
+                        } else {
+                            debug!(
+                                "shard {shard_id} send failures: \
+                                 {total_failed} packets across {n_dests} \
+                                 dests. First error: {e}"
+                            );
+                        }
                     }
                 }
 
