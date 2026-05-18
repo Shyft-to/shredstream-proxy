@@ -76,6 +76,15 @@
 </p>
 <div class="charts-grid" id="workerGrid"></div>
 
+<h2>End-to-End Barrier Latency (<code>avg_end_to_end_us</code> / <code>max_end_to_end_us</code>)</h2>
+<p class="description" style="margin-bottom:12px;">
+  Canonical proxy-side latency: <code>recv → last shard's sendmmsg returned</code> for the SAME batch,
+  recorded by the shard whose <code>AcqRel fetch_sub</code> brings the per-batch counter to zero.
+  Only emitted by runs with the per-batch barrier wired in (Run 9 onwards) —
+  earlier runs show gaps here. <b>Use these to compare optimizations across runs.</b>
+</p>
+<div class="charts-grid" id="e2eGrid"></div>
+
 <h2>Throughput</h2>
 <div class="charts-grid" id="throughputGrid"></div>
 
@@ -339,6 +348,29 @@ const RUNS = [
       { time: "05:01:55Z", batches: 23186, packets: 33555, dest_sends: 185488, avg_total_us: 2, avg_dedup_us: 0, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 101, max_fanout_send_us:  60, max_per_dest_us: null, avg_worker_send_us: 18, max_worker_send_us:  735, worker_packets_sent: 268440 },
     ],
   },
+  {
+    name: "Run 9 (2026-05-18) — connected sockets + honest e2e barrier metric",
+    description: "2026-05-18, fra-shred-proxy PRODUCTION (2 co-located instances). First run with the per-batch e2e barrier metric — captures recv → last shard's sendmmsg returned for THIS batch (lock-free Arc<BatchTrace> + AcqRel counter; last shard records elapsed). Same run also lands the connected-socket optimization: each shard now holds 1 connected UdpSocket per destination, doing one sendmmsg(2) per dest with msg_name=NULL (kernel uses cached connect() peer; per-datagram route lookup skipped). HONEST E2E: avg_end_to_end_us = ~49 µs, max_end_to_end_us = ~997 µs avg / 1327 µs peak. This is the real proxy-side latency. KEY FINDING: our previous 'end-to-end ≈ avg_total + avg_worker_send' estimate (Run 7 said ~19 µs, Run 8 said ~21 µs) was a SERIOUS UNDERESTIMATE — the new metric reveals the actual number is 2-3× higher. The simple sum missed (a) shard channel pickup latency, (b) the slowest-shard tail (avg averages across shards; e2e is bounded by the slowest), (c) CPU preemption under co-location. avg_total_us=3 µs and avg_worker_send_us=21 µs are unchanged from Run 8 — the architecture hasn't slowed down, the metric just got honest. CONNECTED SOCKETS NEAR-NEUTRAL HERE: avg_worker_send_us went from ~19 µs (Run 8) → ~21 µs (Run 9). The expected ~5 µs/shard saving from skipped route lookup is offset by the new cost of one sendmmsg PER destination instead of one batched sendmmsg covering all (packet, dest) pairs. At P=1, the per-syscall overhead dominates. e2e_batches == batches throughout — the barrier fires exactly once per batch. 12 samples at 10s cadence.",
+    samples: [
+      // time, batches, packets, dest_sends, avg_total_us, avg_dedup_us,
+      // avg_fanout_send_us (= avg_fanout_dispatch_us), avg_max_per_dest_us (null),
+      // max_total_us, max_fanout_send_us (= max_fanout_dispatch_us), max_per_dest_us (null),
+      // avg_worker_send_us, max_worker_send_us, worker_packets_sent,
+      // avg_end_to_end_us, max_end_to_end_us, e2e_batches
+      { time: "11:00:33Z", batches: 17446, packets: 34033, dest_sends: 139568, avg_total_us: 5, avg_dedup_us: 3, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 689, max_fanout_send_us:  48, max_per_dest_us: null, avg_worker_send_us: 23, max_worker_send_us:  672, worker_packets_sent: 272264, avg_end_to_end_us: 52, max_end_to_end_us:  846, e2e_batches: 17446 },
+      { time: "11:00:43Z", batches: 22928, packets: 38795, dest_sends: 183424, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 298, max_fanout_send_us: 283, max_per_dest_us: null, avg_worker_send_us: 19, max_worker_send_us:  467, worker_packets_sent: 310360, avg_end_to_end_us: 38, max_end_to_end_us:  700, e2e_batches: 22928 },
+      { time: "11:00:53Z", batches: 20980, packets: 38647, dest_sends: 167840, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 1, avg_max_per_dest_us: null, max_total_us: 347, max_fanout_send_us:  45, max_per_dest_us: null, avg_worker_send_us: 21, max_worker_send_us:  738, worker_packets_sent: 309176, avg_end_to_end_us: 46, max_end_to_end_us:  823, e2e_batches: 20980 },
+      { time: "11:01:03Z", batches: 19153, packets: 37525, dest_sends: 153224, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us:  83, max_fanout_send_us:  30, max_per_dest_us: null, avg_worker_send_us: 23, max_worker_send_us:  652, worker_packets_sent: 300200, avg_end_to_end_us: 51, max_end_to_end_us: 1138, e2e_batches: 19153 },
+      { time: "11:01:13Z", batches: 19733, packets: 36217, dest_sends: 157864, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 137, max_fanout_send_us:  54, max_per_dest_us: null, avg_worker_send_us: 21, max_worker_send_us:  634, worker_packets_sent: 289736, avg_end_to_end_us: 49, max_end_to_end_us: 1124, e2e_batches: 19733 },
+      { time: "11:01:23Z", batches: 19808, packets: 36929, dest_sends: 158464, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us:  79, max_fanout_send_us:  77, max_per_dest_us: null, avg_worker_send_us: 22, max_worker_send_us:  633, worker_packets_sent: 295432, avg_end_to_end_us: 51, max_end_to_end_us:  788, e2e_batches: 19808 },
+      { time: "11:01:33Z", batches: 19201, packets: 36608, dest_sends: 153608, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us:  68, max_fanout_send_us:  45, max_per_dest_us: null, avg_worker_send_us: 23, max_worker_send_us: 1116, worker_packets_sent: 292864, avg_end_to_end_us: 60, max_end_to_end_us: 1130, e2e_batches: 19201 },
+      { time: "11:01:43Z", batches: 15479, packets: 33554, dest_sends: 123832, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 186, max_fanout_send_us: 183, max_per_dest_us: null, avg_worker_send_us: 25, max_worker_send_us:  590, worker_packets_sent: 268432, avg_end_to_end_us: 52, max_end_to_end_us:  985, e2e_batches: 15479 },
+      { time: "11:01:53Z", batches: 22509, packets: 38070, dest_sends: 180072, avg_total_us: 3, avg_dedup_us: 0, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 323, max_fanout_send_us: 180, max_per_dest_us: null, avg_worker_send_us: 20, max_worker_send_us:  651, worker_packets_sent: 304560, avg_end_to_end_us: 54, max_end_to_end_us: 1091, e2e_batches: 22509 },
+      { time: "11:02:03Z", batches: 24726, packets: 38781, dest_sends: 197808, avg_total_us: 2, avg_dedup_us: 0, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 262, max_fanout_send_us:  37, max_per_dest_us: null, avg_worker_send_us: 19, max_worker_send_us:  788, worker_packets_sent: 310248, avg_end_to_end_us: 45, max_end_to_end_us:  824, e2e_batches: 24726 },
+      { time: "11:02:13Z", batches: 23984, packets: 42349, dest_sends: 191872, avg_total_us: 2, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 177, max_fanout_send_us:  32, max_per_dest_us: null, avg_worker_send_us: 20, max_worker_send_us: 1067, worker_packets_sent: 338792, avg_end_to_end_us: 44, max_end_to_end_us: 1327, e2e_batches: 23984 },
+      { time: "11:02:23Z", batches: 20742, packets: 38138, dest_sends: 165936, avg_total_us: 3, avg_dedup_us: 1, avg_fanout_send_us: 0, avg_max_per_dest_us: null, max_total_us: 118, max_fanout_send_us: 114, max_per_dest_us: null, avg_worker_send_us: 21, max_worker_send_us:  784, worker_packets_sent: 305104, avg_end_to_end_us: 41, max_end_to_end_us: 1185, e2e_batches: 20742 },
+    ],
+  },
   // Add additional runs below. Template:
   // {
   //   name: "Run N (YYYY-MM-DD) — <what changed>",
@@ -433,6 +465,21 @@ const METRICS = [
     why:  'Worker-side tail latency. A spike here is one slow destination / NIC queue, isolated to that one worker — it no longer blocks the other destinations the way the old serial fanout loop did.',
   },
 
+  // End-to-end barrier latency — emitted from Run 9 onward.
+  // `recv → last shard\'s sendmmsg returned for the SAME batch`, recorded
+  // by the shard that drives the per-batch shard_remaining AtomicU32 to 0.
+  // Older runs show null for these fields.
+  {
+    id: 'avg_end_to_end_us', title: 'avg_end_to_end_us', unit: 'us', group: 'e2e', pick: s => s.avg_end_to_end_us ?? null,
+    what: '<b>Canonical end-to-end latency.</b> Per-batch elapsed from coordinator recv until the slowest shard\'s sendmmsg returned for THAT batch. Recorded by the shard whose AcqRel fetch_sub brings the per-batch counter to zero.',
+    why:  'The honest proxy-side latency number. Captures the slowest-shard tail and channel pickup jitter that older metrics (avg_total_us, avg_worker_send_us) hide. Use THIS to compare optimizations across runs — the older sum was an underestimate.',
+  },
+  {
+    id: 'max_end_to_end_us', title: 'max_end_to_end_us', unit: 'us', group: 'e2e', pick: s => s.max_end_to_end_us ?? null,
+    what: 'Worst single-batch end-to-end observed in the 10s window.',
+    why:  'Tail end-to-end. The single number that downstream consumers actually experience on a bad batch. Watch this when working on CPU-pinning / co-located-instance fixes.',
+  },
+
   // Throughput — load context for the latency numbers.
   {
     id: 'batches', title: 'batches', unit: 'count', group: 'throughput', pick: s => s.batches,
@@ -511,16 +558,26 @@ const GRID_EL = {
   avgLatency: document.getElementById('avgLatencyGrid'),
   maxLatency: document.getElementById('maxLatencyGrid'),
   worker: document.getElementById('workerGrid'),
+  e2e: document.getElementById('e2eGrid'),
   throughput: document.getElementById('throughputGrid'),
 };
-METRICS.forEach(m => createChartCard(m, GRID_EL[m.group]));
+METRICS.forEach(m => {
+  const grid = GRID_EL[m.group];
+  // Skip metrics whose group has no matching <div> in the page rather than
+  // crashing the whole script (which would also skip renderSummaryTable below).
+  if (!grid) {
+    console.warn(`No grid for metric group ${m.group}; skipping ${m.id}`);
+    return;
+  }
+  createChartCard(m, grid);
+});
 
 // ============================================================
 // Per-run summary table. For the headline latency metrics we also show
 // p50 / p99 across the window samples — those tails are exactly what the
 // fanout optimization is meant to flatten.
 // ============================================================
-const SUMMARY_TAIL_IDS = new Set(['avg_total_us', 'avg_fanout_send_us', 'max_total_us', 'max_fanout_send_us', 'max_per_dest_us', 'max_worker_send_us']);
+const SUMMARY_TAIL_IDS = new Set(['avg_total_us', 'avg_fanout_send_us', 'max_total_us', 'max_fanout_send_us', 'max_per_dest_us', 'max_worker_send_us', 'avg_end_to_end_us', 'max_end_to_end_us']);
 
 function renderSummaryTable() {
   // Two-row header: top row = metric banner (with unit); bottom row = stat (avg/p50/p99) across windows.
