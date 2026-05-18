@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
@@ -54,9 +54,42 @@ const DEST_SCRATCH_INITIAL_CAPACITY: usize = 128;
 /// `unioned_dest_sockets`.
 const DEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Per-batch latency trace shared between the coordinator and every worker
+/// that received the batch. Created once per batch by the coordinator when
+/// trace mode is on. Each worker does `fetch_sub(1, AcqRel)` on
+/// `workers_remaining` after its `batch_send` returns; the worker whose
+/// decrement brings the counter to 0 records `t_start.elapsed()` into the
+/// e2e metric fields.
+///
+/// This is the canonical "recv → last worker's sendmmsg returned for THIS
+/// batch" measurement. Older fields (`avg_total_us`, `avg_worker_send_us`)
+/// only capture pieces of the pipeline; this is the full barrier.
+pub struct BatchTrace {
+    pub t_start: Instant,
+    pub workers_remaining: AtomicU32,
+}
+
+impl BatchTrace {
+    /// Construct a new trace with `workers_remaining` initialized to N (the
+    /// number of workers we are about to dispatch to). The counter is set
+    /// up-front so any worker that picks the batch up before the coordinator
+    /// finishes its try_send loop still sees a sane initial value.
+    pub fn new(t_start: Instant, num_workers: u32) -> Self {
+        Self {
+            t_start,
+            workers_remaining: AtomicU32::new(num_workers),
+        }
+    }
+}
+
+/// What a worker receives over its channel — the batch and an optional
+/// per-batch trace. `None` when trace mode is off (zero allocation, the
+/// worker skips the barrier block).
+pub type WorkerMsg = (Arc<PacketBatch>, Option<Arc<BatchTrace>>);
+
 /// One channel per active destination. Coordinator threads load a snapshot
-/// of this map and dispatch `Arc<PacketBatch>` to each sender.
-pub type DestSenderMap = HashMap<SocketAddr, crossbeam_channel::Sender<Arc<PacketBatch>>>;
+/// of this map and dispatch a `WorkerMsg` to each sender.
+pub type DestSenderMap = HashMap<SocketAddr, crossbeam_channel::Sender<WorkerMsg>>;
 
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
@@ -242,8 +275,8 @@ fn spawn_dest_worker(
     dest: SocketAddr,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
-) -> (crossbeam_channel::Sender<Arc<PacketBatch>>, JoinHandle<()>) {
-    let (tx, rx) = crossbeam_channel::bounded::<Arc<PacketBatch>>(DEST_CHANNEL_CAPACITY);
+) -> (crossbeam_channel::Sender<WorkerMsg>, JoinHandle<()>) {
+    let (tx, rx) = crossbeam_channel::bounded::<WorkerMsg>(DEST_CHANNEL_CAPACITY);
     // Box the destination so its address is stable for the lifetime of the
     // thread — references into it can safely be transmuted to 'static.
     let dest_boxed: Box<SocketAddr> = Box::new(dest);
@@ -263,7 +296,7 @@ fn spawn_dest_worker(
 fn run_dest_worker(
     dest_boxed: Box<SocketAddr>,
     bind_addr: SocketAddr,
-    rx: crossbeam_channel::Receiver<Arc<PacketBatch>>,
+    rx: crossbeam_channel::Receiver<WorkerMsg>,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
 ) {
@@ -293,7 +326,7 @@ fn run_dest_worker(
 
     while !exit.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(batch) => {
+            Ok((batch, trace)) => {
                 debug_assert!(scratch.is_empty());
                 let t_send = trace_on.then(Instant::now);
                 let batch_packet_count = batch.len();
@@ -341,6 +374,25 @@ fn run_dest_worker(
                         .worker_packets_sent
                         .fetch_add(batch_packet_count as u64, Ordering::Relaxed);
                     update_max_atomic(&metrics.worker_send_us_max, send_us);
+                }
+
+                // E2E barrier: if this batch carries a trace, decrement the
+                // remaining-worker counter. The worker whose decrement brings
+                // it to 0 is the last to finish sending for this batch and
+                // records the full recv→send-done elapsed time.
+                //
+                // AcqRel ordering ensures the e2e read of t_start.elapsed()
+                // happens-after every peer worker's losing fetch_sub.
+                if let Some(t) = trace {
+                    let prev = t.workers_remaining.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        let e2e_us = t.t_start.elapsed().as_micros() as u64;
+                        metrics.e2e_batches.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .e2e_us_sum
+                            .fetch_add(e2e_us, Ordering::Relaxed);
+                        update_max_atomic(&metrics.e2e_us_max, e2e_us);
+                    }
                 }
 
                 drop(batch);
@@ -557,13 +609,43 @@ fn recv_from_channel_and_send_multiple_dest(
     let senders_snapshot = dest_senders.load();
     let num_dest = senders_snapshot.len() as u64;
     let mut dropped: u64 = 0;
+    // Construct the per-batch e2e trace in trace mode. `workers_remaining`
+    // is initialized to N up-front (so any worker that picks the batch up
+    // before we finish the try_send loop already sees a sane counter). On
+    // try_send failures the coordinator compensates by decrementing here —
+    // preserving the invariant that exactly N decrements happen per trace.
+    //
+    // SAFETY of `t_batch_start.unwrap()`: gated on `trace_on`, which is the
+    // same flag that made `mark()` return `Some` at the top of this fn.
+    let trace: Option<Arc<BatchTrace>> = trace_on.then(|| {
+        Arc::new(BatchTrace::new(
+            t_batch_start.unwrap(),
+            num_dest as u32,
+        ))
+    });
+
     for sender in senders_snapshot.values() {
-        match sender.try_send(arc_batch.clone()) {
+        match sender.try_send((arc_batch.clone(), trace.clone())) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => dropped += 1,
-            Err(TrySendError::Disconnected(_)) => dropped += 1,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                dropped += 1;
+                // Compensate for the missing worker decrement. If this brings
+                // the counter to 0 we ARE the last "writer" for this batch
+                // and record the e2e elapsed ourselves.
+                if let Some(t) = &trace {
+                    let prev = t.workers_remaining.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        let e2e_us = t.t_start.elapsed().as_micros() as u64;
+                        metrics.e2e_batches.fetch_add(1, Ordering::Relaxed);
+                        metrics.e2e_us_sum.fetch_add(e2e_us, Ordering::Relaxed);
+                        update_max_atomic(&metrics.e2e_us_max, e2e_us);
+                    }
+                }
+            }
         }
     }
+    // Edge case: N == 0 (no workers published yet). No worker will decrement;
+    // the trace silently expires when its last Arc clone is dropped.
     if dropped > 0 {
         metrics
             .worker_dropped_batches
@@ -829,6 +911,20 @@ pub struct ShredMetrics {
     /// channel was full or disconnected. Backpressure indicator.
     pub worker_dropped_batches: AtomicU64,
 
+    // End-to-end barrier metrics (per reporting interval; reset on tick).
+    // These are the canonical "recv → last worker's sendmmsg returned"
+    // numbers. Older `forward_total_us_*` / `worker_send_us_*` are kept
+    // for diagnostics but only measure pieces of the pipeline.
+    /// Number of batches for which the e2e barrier completed (every worker
+    /// that received the batch decremented the per-batch counter to zero).
+    /// In steady state this equals `forward_batches`; if a coordinator
+    /// dropped to ALL workers (rare), the trace expires without recording.
+    pub e2e_batches: AtomicU64,
+    /// Sum of per-batch e2e wall-clock (microseconds).
+    pub e2e_us_sum: AtomicU64,
+    /// Max single-batch e2e wall-clock observed (microseconds). Tail metric.
+    pub e2e_us_max: AtomicU64,
+
     // cumulative metrics (persist after reset)
     pub agg_received_cumulative: AtomicU64,
     pub agg_success_forward_cumulative: AtomicU64,
@@ -876,6 +972,9 @@ impl ShredMetrics {
             worker_send_us_max: Default::default(),
             worker_packets_sent: Default::default(),
             worker_dropped_batches: Default::default(),
+            e2e_batches: Default::default(),
+            e2e_us_sum: Default::default(),
+            e2e_us_max: Default::default(),
             agg_received_cumulative: Default::default(),
             agg_success_forward_cumulative: Default::default(),
             agg_fail_forward_cumulative: Default::default(),
@@ -967,6 +1066,23 @@ impl ShredMetrics {
             .load(Ordering::Relaxed);
         let div = batches;
         let dropped = self.worker_dropped_batches.load(Ordering::Relaxed);
+
+        // End-to-end barrier metrics. `e2e_batches` ≈ `forward_batches` in
+        // steady state; divisor is the same when populated. If the e2e
+        // barrier never completed for any batch in this interval (e.g.
+        // every coordinator dispatch was dropped), emit zeros so the field
+        // is still present in the datapoint and downstream parsers stay
+        // stable.
+        let e2e_batches = self.e2e_batches.load(Ordering::Relaxed);
+        let (avg_end_to_end_us, max_end_to_end_us) = if e2e_batches > 0 {
+            (
+                (self.e2e_us_sum.load(Ordering::Relaxed) / e2e_batches) as i64,
+                self.e2e_us_max.load(Ordering::Relaxed) as i64,
+            )
+        } else {
+            (0i64, 0i64)
+        };
+
         datapoint_info!(
             "shredstream_proxy-forwarding_perf",
             ("batches", batches as i64, i64),
@@ -991,6 +1107,10 @@ impl ShredMetrics {
                 self.forward_fanout_send_us_max.load(Ordering::Relaxed) as i64,
                 i64
             ),
+            // Canonical end-to-end barrier — see field docs on ShredMetrics.
+            ("e2e_batches", e2e_batches as i64, i64),
+            ("avg_end_to_end_us", avg_end_to_end_us, i64),
+            ("max_end_to_end_us", max_end_to_end_us, i64),
         );
 
         // Worker-side metrics (per-destination send latency). These are the
@@ -1056,6 +1176,11 @@ impl ShredMetrics {
         self.worker_send_us_max.store(0, Ordering::Relaxed);
         self.worker_packets_sent.store(0, Ordering::Relaxed);
         self.worker_dropped_batches.store(0, Ordering::Relaxed);
+
+        // e2e barrier counters
+        self.e2e_batches.store(0, Ordering::Relaxed);
+        self.e2e_us_sum.store(0, Ordering::Relaxed);
+        self.e2e_us_max.store(0, Ordering::Relaxed);
     }
 }
 
