@@ -1,13 +1,18 @@
 use std::{
-    collections::HashSet,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
     time::{Duration, Instant, SystemTime},
 };
+
+// `AsRawFd` is only needed by the Linux `sendmmsg(2)` path; pull it in
+// locally there to avoid an unused-import warning on macOS dev builds.
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, RecvError, TryRecvError, TrySendError};
@@ -26,10 +31,7 @@ use solana_perf::{
     recycler::Recycler,
 };
 use solana_sdk::clock::Slot;
-use solana_streamer::{
-    sendmmsg::{batch_send, SendPktsError},
-    streamer::{self, StreamerReceiveStats},
-};
+use solana_streamer::streamer::{self, StreamerReceiveStats};
 use tokio::sync::broadcast::Sender;
 
 use crate::{
@@ -70,22 +72,78 @@ fn compute_send_shards() -> usize {
     (par / 4).clamp(MIN_SEND_SHARDS, MAX_SEND_SHARDS)
 }
 
+/// Per-batch latency trace shared between the coordinator and every shard
+/// that received the batch. Created once per batch by the coordinator when
+/// trace mode is on. Each shard does `fetch_sub(1, AcqRel)` on
+/// `shard_remaining` after its `sendmmsg` returns; the shard whose decrement
+/// brings the counter to 0 records `t_start.elapsed()` into the e2e metric
+/// fields.
+///
+/// This is the canonical "recv → last shard's sendmmsg returned for THIS
+/// batch" measurement. Older fields (`avg_total_us`, `avg_worker_send_us`)
+/// only capture pieces of the pipeline; this is the full barrier.
+pub struct BatchTrace {
+    pub t_start: Instant,
+    pub shard_remaining: AtomicU32,
+}
+
+impl BatchTrace {
+    /// Construct a new trace with `shard_remaining` initialized to N (the
+    /// number of shards we are about to dispatch to). The counter is set
+    /// up-front so any shard that picks the batch up before the coordinator
+    /// finishes its try_send loop still sees a sane initial value.
+    pub fn new(t_start: Instant, num_shards: u32) -> Self {
+        #[cfg(test)]
+        BATCH_TRACE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            t_start,
+            shard_remaining: AtomicU32::new(num_shards),
+        }
+    }
+}
+
+/// Test-only counter that increments on every `BatchTrace::new()`. Used by
+/// `test_trace_off_zero_overhead_no_batch_trace_alloc` to assert that no
+/// trace is allocated when the trace log level is off.
+#[cfg(test)]
+pub(crate) static BATCH_TRACE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+/// What a shard receives over its channel — the batch and an optional
+/// per-batch trace. `None` when trace mode is off (zero allocation, the
+/// shard skips the barrier block).
+pub type ShardMsg = (Arc<PacketBatch>, Option<Arc<BatchTrace>>);
+
+/// One connected UDP socket per destination served by a shard. The socket
+/// is bound to `0.0.0.0:0` and `connect()`-ed to `addr`, so the kernel
+/// caches the route lookup. Sent on via `sendmmsg(2)` with `msg_name = NULL`.
+#[derive(Clone)]
+pub struct ConnectedDest {
+    pub addr: SocketAddr,
+    pub socket: Arc<UdpSocket>,
+}
+
 /// Snapshot of the N shard channel senders, published once at startup.
-/// Coordinators load this and dispatch each `Arc<PacketBatch>` to all N
-/// shards.
-pub type ShardSenderList = Vec<crossbeam_channel::Sender<Arc<PacketBatch>>>;
+/// Coordinators load this and dispatch each `Arc<PacketBatch>` (plus the
+/// optional `BatchTrace`) to all N shards.
+pub type ShardSenderList = Vec<crossbeam_channel::Sender<ShardMsg>>;
 
 /// Handle held by the shard manager — owns the destination assignment
-/// (mutated on reconcile), the channel sender, and the thread join.
-struct ShardHandle {
-    /// Current destination slice assigned to this shard. Updated by the
-    /// manager on reconcile; read by the shard thread on every batch via
-    /// an `ArcSwap` load (lock-free, cheap).
-    assignment: Arc<ArcSwap<Vec<SocketAddr>>>,
+/// (mutated on reconcile), the per-destination connected-socket cache, the
+/// channel sender, and the thread join.
+pub struct ShardHandle {
+    /// Currently-assigned destinations + their connected sockets. Updated
+    /// by the manager on reconcile via `ArcSwap::store`; read by the shard
+    /// thread on every batch via a lock-free `load()`.
+    pub assignment: Arc<ArcSwap<Vec<ConnectedDest>>>,
+    /// Manager-owned cache keyed by destination. Used by `reshard_assignments`
+    /// to reuse sockets across reconciles (so destinations that stay in the
+    /// set keep their existing connected `UdpSocket`, preserving the kernel
+    /// route cache). The shard thread NEVER touches this map.
+    pub socket_cache: HashMap<SocketAddr, Arc<UdpSocket>>,
     /// Channel sender for feeding batches to the shard.
-    sender: crossbeam_channel::Sender<Arc<PacketBatch>>,
+    pub sender: crossbeam_channel::Sender<ShardMsg>,
     /// Join handle for the shard thread.
-    join: JoinHandle<()>,
+    pub join: JoinHandle<()>,
 }
 
 /// Bind to ports and start forwarding shreds
@@ -261,27 +319,22 @@ pub fn start_forwarder_threads(
         .collect()
 }
 
-/// Spawn a per-destination worker thread.
-///
-/// The worker owns its own `UdpSocket` (avoiding contention on a shared send
-/// buffer) and a reused scratch `Vec<(&'static [u8], &'static SocketAddr)>`
-/// so the steady-state send loop performs zero heap allocations.
-///
-/// Each received `Arc<PacketBatch>` is sent in a single `batch_send` call,
-/// which is `sendmmsg(2)` on Linux (one syscall for up to 1024 packets).
 /// Spawn one busy-spinning send-shard thread. Returns a `ShardHandle`
-/// holding the assignment ArcSwap, the channel sender, and the join handle.
+/// holding the assignment ArcSwap, the manager-owned socket cache, the
+/// channel sender, and the thread join.
 ///
-/// The shard owns ONE `UdpSocket` (IPv4) used to issue one `batch_send`
-/// (`sendmmsg`) per incoming batch over all `(packet, dest)` pairs in its
-/// current assignment.
-fn spawn_send_shard(
+/// Unlike the previous architecture the shard does **not** own a shared
+/// sending socket. Sockets live per-destination in `ConnectedDest` entries
+/// published via `assignment` (`ArcSwap`). The manager thread creates and
+/// `connect()`-s sockets during `reshard_assignments` and keeps them in
+/// `socket_cache` to reuse across reconciles.
+pub fn spawn_send_shard(
     shard_id: usize,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
 ) -> ShardHandle {
-    let (tx, rx) = crossbeam_channel::bounded::<Arc<PacketBatch>>(SHARD_CHANNEL_CAPACITY);
-    let assignment: Arc<ArcSwap<Vec<SocketAddr>>> =
+    let (tx, rx) = crossbeam_channel::bounded::<ShardMsg>(SHARD_CHANNEL_CAPACITY);
+    let assignment: Arc<ArcSwap<Vec<ConnectedDest>>> =
         Arc::new(ArcSwap::from_pointee(Vec::new()));
     let assignment_for_thread = assignment.clone();
     let name = format!("ssPxyShard_{shard_id}");
@@ -291,6 +344,7 @@ fn spawn_send_shard(
         .expect("failed to spawn send-shard thread");
     ShardHandle {
         assignment,
+        socket_cache: HashMap::new(),
         sender: tx,
         join,
     }
@@ -299,10 +353,18 @@ fn spawn_send_shard(
 /// The body of a busy-spinning send-shard thread.
 ///
 /// Each batch:
-///   1. Load the current destination assignment (ArcSwap, lock-free).
-///   2. Build a flat `Vec<(&[u8], &SocketAddr)>` of `P × (D/N)` pairs.
-///   3. Issue one `batch_send` (= `sendmmsg`) covering the whole shard.
-///   4. Clear scratch and loop.
+///   1. Load the current destination assignment (ArcSwap, lock-free). Every
+///      `ConnectedDest` carries an already-`connect()`-ed `UdpSocket`.
+///   2. For each destination, build a reused `Vec<&[u8]>` of P packet
+///      slices and issue one `sendmmsg(2)` with `msg_name = NULL`.
+///   3. Decrement the per-batch barrier counter (if `trace_on`); the shard
+///      that drives it to 0 records the e2e elapsed time.
+///   4. Clear per-dest scratch and loop.
+///
+/// One `sendmmsg` per destination is required because `sendmmsg(2)` takes
+/// a single fd and our connected sockets are per-destination. The win is
+/// that the kernel skips per-datagram route lookup (cached on connect()),
+/// dropping `t_datagram` from ~4 µs to ~1 µs.
 ///
 /// STRATEGY 1 (no parking) is preserved: the shard polls via `try_recv` +
 /// `std::hint::spin_loop()`. Empty polls cost ~zero kernel work.
@@ -312,100 +374,103 @@ fn spawn_send_shard(
 /// `available_parallelism()` — see `compute_send_shards`.
 fn run_send_shard(
     shard_id: usize,
-    assignment: Arc<ArcSwap<Vec<SocketAddr>>>,
-    rx: crossbeam_channel::Receiver<Arc<PacketBatch>>,
+    assignment: Arc<ArcSwap<Vec<ConnectedDest>>>,
+    rx: crossbeam_channel::Receiver<ShardMsg>,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
 ) {
-    // Bind one IPv4 sending socket per shard. (Solana TVU destinations are
-    // IPv4 in practice; v6 dests in the assignment will be skipped with a
-    // warning at first sight.)
-    let socket = match UdpSocket::bind(SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        0,
-    )) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("shard {shard_id} failed to bind send socket: {e}");
-            return;
-        }
-    };
-
-    // Reused scratch — see SAFETY notes inside the hot loop. We `clear()`
-    // before every iteration boundary so no transmuted 'static reference
-    // escapes the function.
-    let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> =
-        Vec::with_capacity(SHARD_SCRATCH_INITIAL_CAPACITY);
+    // Per-destination scratch. Indexed in lock-step with the current
+    // assignment. Sub-vec capacity is preserved across batches; we only
+    // grow the outer Vec when the destination count grows.
+    //
+    // SAFETY: the `&'static [u8]` slices stored here borrow from the
+    // `Arc<PacketBatch>` for the current iteration. Every sub-vec is
+    // `clear()`-ed before the batch is dropped at the end of the iteration —
+    // no transmuted reference outlives the batch.
+    let mut per_dest_scratch: Vec<Vec<&'static [u8]>> = Vec::new();
+    per_dest_scratch
+        .reserve(SHARD_SCRATCH_INITIAL_CAPACITY.max(1));
 
     let trace_on = log_enabled!(Level::Trace);
-    let mut warned_v6 = false;
 
     loop {
         match rx.try_recv() {
-            Ok(batch) => {
-                debug_assert!(scratch.is_empty());
+            Ok((batch, trace)) => {
                 let t_send = trace_on.then(Instant::now);
                 let batch_packet_count = batch.len();
 
-                // Snapshot the current destination assignment for this batch.
-                // `dests` is an `arc_swap::Guard<Arc<Vec<SocketAddr>>>` and
-                // outlives the scratch fill + send below.
+                // Snapshot the current destination assignment. The Guard
+                // outlives both the scratch fill and the send phase below.
                 let dests = assignment.load();
+                let n_dests = dests.len();
 
-                if !warned_v6 && dests.iter().any(|d| matches!(d, SocketAddr::V6(_))) {
-                    warn!(
-                        "shard {shard_id} has IPv6 destination(s) in its assignment; \
-                         only IPv4 dests will be sent (shard socket is IPv4-only)."
-                    );
-                    warned_v6 = true;
+                // Resize per-dest scratch up to current dest count. Existing
+                // sub-vecs keep their allocated capacity.
+                if per_dest_scratch.len() < n_dests {
+                    per_dest_scratch.resize_with(n_dests, Vec::new);
+                }
+                // Defensive clear in case a previous iteration left data
+                // (it shouldn't — we clear before iteration end below).
+                for sub in per_dest_scratch.iter_mut().take(n_dests) {
+                    debug_assert!(sub.is_empty());
+                    sub.clear();
                 }
 
+                // Fill: each packet goes into every destination's bucket.
                 for pkt in batch.iter() {
                     if let Some(data) = pkt.data(..) {
                         // SAFETY: `data` borrows from `batch`, held for this
-                        // loop iteration. `scratch.clear()` runs before this
-                        // iteration ends — no transmuted ref escapes.
+                        // iteration. Sub-vecs are cleared before iteration
+                        // end — no transmuted ref escapes.
                         let data_static: &'static [u8] =
                             unsafe { std::mem::transmute(data) };
-                        for dest in dests.iter() {
-                            if matches!(dest, SocketAddr::V6(_)) {
-                                continue;
+                        for sub in per_dest_scratch.iter_mut().take(n_dests) {
+                            sub.push(data_static);
+                        }
+                    }
+                }
+
+                // Send: one `sendmmsg(2)` per connected destination.
+                let mut total_sent: u64 = 0;
+                let mut total_failed: u64 = 0;
+                let mut first_err: Option<std::io::Error> = None;
+                for (i, dest) in dests.iter().enumerate() {
+                    let pkts = &per_dest_scratch[i];
+                    if pkts.is_empty() {
+                        continue;
+                    }
+                    match sendmmsg_connected(&dest.socket, pkts) {
+                        Ok(sent) => total_sent += sent as u64,
+                        Err(e) => {
+                            total_failed += pkts.len() as u64;
+                            if first_err.is_none() {
+                                first_err = Some(e);
                             }
-                            // SAFETY: `dest` borrows from the loaded
-                            // `assignment` Guard, held for this iteration.
-                            // Cleared with the scratch before iteration end.
-                            let dest_static: &'static SocketAddr =
-                                unsafe { std::mem::transmute(dest) };
-                            scratch.push((data_static, dest_static));
                         }
                     }
                 }
 
-                let to_send = scratch.len() as u64;
-                if to_send > 0 {
-                    match batch_send(&socket, &scratch) {
-                        Ok(()) => {
-                            metrics
-                                .success_forward
-                                .fetch_add(to_send, Ordering::Relaxed);
-                        }
-                        Err(SendPktsError::IoError(err, num_failed)) => {
-                            metrics
-                                .fail_forward
-                                .fetch_add(num_failed as u64, Ordering::Relaxed);
-                            metrics.success_forward.fetch_add(
-                                to_send.saturating_sub(num_failed as u64),
-                                Ordering::Relaxed,
-                            );
-                            error!(
-                                "shard {shard_id} failed batch of {to_send}: \
-                                 {num_failed} failed. Error: {err}"
-                            );
-                        }
+                if total_sent > 0 {
+                    metrics
+                        .success_forward
+                        .fetch_add(total_sent, Ordering::Relaxed);
+                }
+                if total_failed > 0 {
+                    metrics
+                        .fail_forward
+                        .fetch_add(total_failed, Ordering::Relaxed);
+                    if let Some(e) = first_err {
+                        error!(
+                            "shard {shard_id} send failures: {total_failed} \
+                             packets across {n_dests} dests. First error: {e}"
+                        );
                     }
                 }
-                scratch.clear();
 
+                // Per-shard send timing (existing `worker_send_us_*` metric).
+                // Its semantics are now "sum of all per-dest sendmmsg in this
+                // shard for this batch" — wider than before, but still the
+                // right number for diagnosing per-shard send cost.
                 if let Some(t) = t_send {
                     let send_us = t.elapsed().as_micros() as u64;
                     metrics.worker_batches.fetch_add(1, Ordering::Relaxed);
@@ -416,6 +481,32 @@ fn run_send_shard(
                         .worker_packets_sent
                         .fetch_add(batch_packet_count as u64, Ordering::Relaxed);
                     update_max_atomic(&metrics.worker_send_us_max, send_us);
+                }
+
+                // E2E barrier: if this batch carries a trace, decrement the
+                // remaining-shard counter. The shard whose decrement brings
+                // it to 0 is the last shard to finish sending for this batch
+                // and records the full recv→send-done elapsed time.
+                //
+                // AcqRel ordering ensures the metric writes done by peer
+                // shards on losing decrements are visible to the winning
+                // shard's e2e_us read of t_start.elapsed().
+                if let Some(t) = trace {
+                    let prev = t.shard_remaining.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        let e2e_us = t.t_start.elapsed().as_micros() as u64;
+                        metrics.e2e_batches.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .e2e_us_sum
+                            .fetch_add(e2e_us, Ordering::Relaxed);
+                        update_max_atomic(&metrics.e2e_us_max, e2e_us);
+                    }
+                }
+
+                // Clear scratch BEFORE dropping batch so the transmuted
+                // 'static slices are gone before their backing storage is.
+                for sub in per_dest_scratch.iter_mut().take(n_dests) {
+                    sub.clear();
                 }
 
                 drop(batch);
@@ -430,6 +521,122 @@ fn run_send_shard(
         }
     }
     info!("Exiting send shard {shard_id}.");
+}
+
+/// `sendmmsg(2)` wrapper for a **connected** UDP socket. Each packet
+/// becomes one `mmsghdr` with `msg_name = NULL` / `msg_namelen = 0` —
+/// the kernel uses the socket's cached peer address (set via `connect()`).
+/// Chunks at `UIO_MAXIOV` like `solana_streamer::batch_send_max_iov`.
+///
+/// Returns the number of packets the kernel reports as sent. On error,
+/// returns the first I/O error encountered; subsequent packets are
+/// dropped and counted as failures by the caller.
+///
+/// Non-Linux fallback uses `send(2)` per packet — kept for cross-platform
+/// dev builds (production is Linux-only). The Linux path is the only one
+/// that hits the optimized kernel route cache from `connect()`.
+fn sendmmsg_connected(socket: &UdpSocket, packets: &[&[u8]]) -> std::io::Result<usize> {
+    if packets.is_empty() {
+        return Ok(0);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        sendmmsg_connected_linux(socket, packets)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        sendmmsg_connected_fallback(socket, packets)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sendmmsg_connected_linux(
+    socket: &UdpSocket,
+    packets: &[&[u8]],
+) -> std::io::Result<usize> {
+    let fd = socket.as_raw_fd();
+    let mut total_sent: usize = 0;
+
+    // libc::UIO_MAXIOV is the kernel cap on per-syscall mmsghdr count (1024
+    // on Linux). For our P=1..few workloads we never chunk; the loop is for
+    // safety only.
+    let max_iov = libc::UIO_MAXIOV as usize;
+
+    let mut first_err: Option<std::io::Error> = None;
+    for chunk in packets.chunks(max_iov) {
+        // Build parallel iovec[] and mmsghdr[] arrays. Per-message
+        // msg_name=NULL — the kernel uses the connected peer.
+        let mut iovecs: Vec<libc::iovec> = chunk
+            .iter()
+            .map(|pkt| libc::iovec {
+                iov_base: pkt.as_ptr() as *mut libc::c_void,
+                iov_len: pkt.len(),
+            })
+            .collect();
+
+        // SAFETY: zero-init mmsghdr is valid (all-zero msghdr means
+        // msg_name=NULL, msg_namelen=0, msg_control=NULL, msg_controllen=0,
+        // msg_flags=0). We then fill iov fields below.
+        let mut hdrs: Vec<libc::mmsghdr> = vec![
+            unsafe { std::mem::zeroed::<libc::mmsghdr>() };
+            chunk.len()
+        ];
+        for (i, hdr) in hdrs.iter_mut().enumerate() {
+            hdr.msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            hdr.msg_hdr.msg_iovlen = 1;
+            // msg_name / msg_namelen left at zero — connected socket path.
+        }
+
+        // sendmmsg can do a short send; loop until everything is consumed
+        // or we hit a fatal error on a specific message.
+        let mut pkts = &mut hdrs[..];
+        while !pkts.is_empty() {
+            let n = unsafe {
+                libc::sendmmsg(fd, pkts.as_mut_ptr(), pkts.len() as u32, 0)
+            };
+            if n == -1 {
+                if first_err.is_none() {
+                    first_err = Some(std::io::Error::last_os_error());
+                }
+                // Skip the failing packet and retry the rest, mirroring
+                // solana_streamer's sendmmsg_retry strategy.
+                pkts = &mut pkts[1..];
+            } else {
+                total_sent += n as usize;
+                pkts = &mut pkts[n as usize..];
+            }
+        }
+    }
+
+    if let Some(e) = first_err {
+        Err(e)
+    } else {
+        Ok(total_sent)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sendmmsg_connected_fallback(
+    socket: &UdpSocket,
+    packets: &[&[u8]],
+) -> std::io::Result<usize> {
+    let mut sent = 0;
+    let mut first_err: Option<std::io::Error> = None;
+    for pkt in packets {
+        match socket.send(pkt) {
+            Ok(_) => sent += 1,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        Err(e)
+    } else {
+        Ok(sent)
+    }
 }
 
 /// Spawns the N busy-spinning send-shard threads ONCE at startup, then
@@ -475,8 +682,9 @@ fn start_shard_manager_thread(
             shard_senders.store(Arc::new(senders_snapshot));
 
             // Initial assignment so shards have something to serve before the
-            // first tick.
-            reshard_assignments(&unioned_dest_sockets, &shards, &metrics);
+            // first tick. `reshard_assignments` is the only writer to each
+            // shard's `socket_cache` — we hold `&mut shards` for that.
+            reshard_assignments(&unioned_dest_sockets, &mut shards, &metrics);
 
             let tick = crossbeam_channel::tick(SHARD_RECONCILE_INTERVAL);
             while !exit.load(Ordering::Relaxed) {
@@ -484,7 +692,7 @@ fn start_shard_manager_thread(
                     recv(tick) -> _ => {
                         reshard_assignments(
                             &unioned_dest_sockets,
-                            &shards,
+                            &mut shards,
                             &metrics,
                         );
                     }
@@ -514,22 +722,26 @@ fn start_shard_manager_thread(
 }
 
 /// Re-distribute the current destination set across the fixed N shards
-/// (round-robin). Each shard's `ArcSwap<Vec<SocketAddr>>` is replaced in
-/// one atomic store — shard threads pick up the new slice on the next
-/// batch via a lock-free `load()`.
+/// (round-robin) and refresh each shard's connected-socket cache. Sockets
+/// for destinations that survive a reshard are **reused** (their cached
+/// kernel route stays warm); new destinations get a fresh `bind() +
+/// connect()`; removed destinations have their sockets dropped (closed).
 ///
-/// Also updates the published `worker_count` metric. Note that
-/// `worker_count` now means **destination count** (D), not shard count;
-/// it's kept under the same field name for dashboard continuity.
+/// Each shard's `ArcSwap<Vec<ConnectedDest>>` is replaced in one atomic
+/// store — shard threads pick up the new slice on their next batch via a
+/// lock-free `load()` and never touch the manager-owned `socket_cache`.
+///
+/// `worker_count` is updated to the destination count D (kept under the
+/// historical field name for dashboard continuity).
 fn reshard_assignments(
     unioned_dest_sockets: &ArcSwap<Vec<SocketAddr>>,
-    shards: &[ShardHandle],
+    shards: &mut [ShardHandle],
     metrics: &Arc<ShredMetrics>,
 ) {
     let desired = unioned_dest_sockets.load();
     let n = shards.len();
 
-    // Round-robin shard i gets dests[i], dests[i+n], dests[i+2n], …
+    // Round-robin: shard i gets dests[i], dests[i+n], dests[i+2n], …
     // Spreads heterogeneous destinations across shards better than
     // contiguous slicing.
     let mut buckets: Vec<Vec<SocketAddr>> = (0..n).map(|_| Vec::new()).collect();
@@ -537,13 +749,66 @@ fn reshard_assignments(
         buckets[idx % n].push(*dest);
     }
 
-    for (shard, bucket) in shards.iter().zip(buckets) {
-        shard.assignment.store(Arc::new(bucket));
+    for (shard, bucket) in shards.iter_mut().zip(buckets) {
+        // Build the new (addr, socket) list, reusing existing sockets for
+        // surviving destinations and creating fresh ones for new dests.
+        // After this loop, anything left in `shard.socket_cache` is stale
+        // and gets dropped (closing the FD).
+        let mut new_assignment: Vec<ConnectedDest> = Vec::with_capacity(bucket.len());
+        let mut next_cache: HashMap<SocketAddr, Arc<UdpSocket>> =
+            HashMap::with_capacity(bucket.len());
+        for addr in &bucket {
+            // IPv4-only: the bind below is `0.0.0.0:0`, so v6 dests can't
+            // be reached through this socket. Skip with a warn-once per
+            // shard (kept simple via per-call check; rare on shred dests).
+            if matches!(addr, SocketAddr::V6(_)) {
+                warn!(
+                    "skipping IPv6 destination {addr} during reshard \
+                     (shard sockets are IPv4-only)"
+                );
+                continue;
+            }
+            let socket = match shard.socket_cache.remove(addr) {
+                Some(s) => s, // reuse: kernel route cache stays warm
+                None => match new_connected_socket(addr) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        warn!(
+                            "failed to bind/connect new socket for {addr} \
+                             during reshard: {e}. Skipping this dest."
+                        );
+                        continue;
+                    }
+                },
+            };
+            next_cache.insert(*addr, socket.clone());
+            new_assignment.push(ConnectedDest {
+                addr: *addr,
+                socket,
+            });
+        }
+        // Anything still in the old cache is now unreferenced — replacing
+        // the HashMap drops them, which closes the FDs.
+        shard.socket_cache = next_cache;
+        shard.assignment.store(Arc::new(new_assignment));
     }
 
     metrics
         .worker_count
         .store(desired.len(), Ordering::Relaxed);
+}
+
+/// Bind a fresh ephemeral IPv4 UDP socket and `connect()` it to `dest`.
+/// On Linux the `connect()` caches the route lookup and next-hop on the
+/// socket, so subsequent `sendmmsg(2)` calls skip those steps — the
+/// single biggest contributor to per-datagram in-kernel cost.
+fn new_connected_socket(dest: &SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = UdpSocket::bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        0,
+    ))?;
+    sock.connect(dest)?;
+    Ok(sock)
 }
 
 /// Lock-free monotonic max update.
@@ -646,14 +911,41 @@ fn recv_from_channel_and_send_multiple_dest(
     // (packet × destination) UDP send count is tracked downstream via
     // success_forward / fail_forward in each shard thread.
     let num_dest = senders_snapshot.len() as u64;
+
+    // Construct the per-batch e2e trace in trace mode. `shard_remaining` is
+    // initialized to N up-front (so any shard that picks the batch up before
+    // we finish the try_send loop already sees a sane counter). On try_send
+    // failures the coordinator compensates by decrementing here — keeping
+    // the invariant that exactly N decrements happen per trace.
+    //
+    // SAFETY of `t_batch_start.unwrap()`: gated on `trace_on`, which is the
+    // same flag that made `mark()` return `Some` at the top of this fn.
+    let trace: Option<Arc<BatchTrace>> = trace_on
+        .then(|| Arc::new(BatchTrace::new(t_batch_start.unwrap(), num_dest as u32)));
+
     let mut dropped: u64 = 0;
     for sender in senders_snapshot.iter() {
-        match sender.try_send(arc_batch.clone()) {
+        match sender.try_send((arc_batch.clone(), trace.clone())) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => dropped += 1,
-            Err(TrySendError::Disconnected(_)) => dropped += 1,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                dropped += 1;
+                // Compensate for the missing shard decrement. If this brings
+                // the counter to 0 we ARE the last "writer" for this batch
+                // and record the e2e elapsed ourselves.
+                if let Some(t) = &trace {
+                    let prev = t.shard_remaining.fetch_sub(1, Ordering::AcqRel);
+                    if prev == 1 {
+                        let e2e_us = t.t_start.elapsed().as_micros() as u64;
+                        metrics.e2e_batches.fetch_add(1, Ordering::Relaxed);
+                        metrics.e2e_us_sum.fetch_add(e2e_us, Ordering::Relaxed);
+                        update_max_atomic(&metrics.e2e_us_max, e2e_us);
+                    }
+                }
+            }
         }
     }
+    // Edge case: N == 0 (no shards published yet). No shard will decrement;
+    // the trace silently expires when its last Arc clone is dropped.
     if dropped > 0 {
         metrics
             .worker_dropped_batches
@@ -919,6 +1211,20 @@ pub struct ShredMetrics {
     /// channel was full or disconnected. Backpressure indicator.
     pub worker_dropped_batches: AtomicU64,
 
+    // End-to-end barrier metrics (per reporting interval; reset on tick).
+    // These are the canonical "recv → last shard's sendmmsg returned"
+    // numbers. Older `forward_total_us_*` / `worker_send_us_*` are kept
+    // for diagnostics but only measure pieces of the pipeline.
+    /// Number of batches for which the e2e barrier completed (every shard
+    /// that received the batch decremented the per-batch counter to zero).
+    /// In steady state this equals `forward_batches`; if a coordinator
+    /// dropped to ALL shards (rare), the trace expires without recording.
+    pub e2e_batches: AtomicU64,
+    /// Sum of per-batch e2e wall-clock (microseconds).
+    pub e2e_us_sum: AtomicU64,
+    /// Max single-batch e2e wall-clock observed (microseconds). Tail metric.
+    pub e2e_us_max: AtomicU64,
+
     // cumulative metrics (persist after reset)
     pub agg_received_cumulative: AtomicU64,
     pub agg_success_forward_cumulative: AtomicU64,
@@ -966,6 +1272,9 @@ impl ShredMetrics {
             worker_send_us_max: Default::default(),
             worker_packets_sent: Default::default(),
             worker_dropped_batches: Default::default(),
+            e2e_batches: Default::default(),
+            e2e_us_sum: Default::default(),
+            e2e_us_max: Default::default(),
             agg_received_cumulative: Default::default(),
             agg_success_forward_cumulative: Default::default(),
             agg_fail_forward_cumulative: Default::default(),
@@ -1057,6 +1366,23 @@ impl ShredMetrics {
             .load(Ordering::Relaxed);
         let div = batches;
         let dropped = self.worker_dropped_batches.load(Ordering::Relaxed);
+
+        // End-to-end barrier metrics. `e2e_batches` ≈ `forward_batches` in
+        // steady state; divisor is the same when populated. If the e2e
+        // barrier never completed for any batch in this interval (e.g.
+        // every coordinator dispatch was dropped), emit zeros so the field
+        // is still present in the datapoint and downstream parsers stay
+        // stable.
+        let e2e_batches = self.e2e_batches.load(Ordering::Relaxed);
+        let (avg_end_to_end_us, max_end_to_end_us) = if e2e_batches > 0 {
+            (
+                (self.e2e_us_sum.load(Ordering::Relaxed) / e2e_batches) as i64,
+                self.e2e_us_max.load(Ordering::Relaxed) as i64,
+            )
+        } else {
+            (0i64, 0i64)
+        };
+
         datapoint_info!(
             "shredstream_proxy-forwarding_perf",
             ("batches", batches as i64, i64),
@@ -1081,6 +1407,10 @@ impl ShredMetrics {
                 self.forward_fanout_send_us_max.load(Ordering::Relaxed) as i64,
                 i64
             ),
+            // Canonical end-to-end barrier — see field docs on ShredMetrics.
+            ("e2e_batches", e2e_batches as i64, i64),
+            ("avg_end_to_end_us", avg_end_to_end_us, i64),
+            ("max_end_to_end_us", max_end_to_end_us, i64),
         );
 
         // Worker-side metrics (per-destination send latency). These are the
@@ -1146,6 +1476,11 @@ impl ShredMetrics {
         self.worker_send_us_max.store(0, Ordering::Relaxed);
         self.worker_packets_sent.store(0, Ordering::Relaxed);
         self.worker_dropped_batches.store(0, Ordering::Relaxed);
+
+        // e2e barrier counters
+        self.e2e_batches.store(0, Ordering::Relaxed);
+        self.e2e_us_sum.store(0, Ordering::Relaxed);
+        self.e2e_us_max.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1153,7 +1488,6 @@ impl ShredMetrics {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-        str::FromStr,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
@@ -1164,6 +1498,7 @@ mod tests {
     };
 
     use arc_swap::ArcSwap;
+    use log::LevelFilter;
     use solana_perf::{
         deduper::Deduper,
         packet::{Meta, Packet, PacketBatch},
@@ -1171,26 +1506,83 @@ mod tests {
     use solana_sdk::packet::{PacketFlags, PACKET_DATA_SIZE};
 
     use crate::forwarder::{
-        recv_from_channel_and_send_multiple_dest, spawn_send_shard, ShardSenderList, ShredMetrics,
+        new_connected_socket, recv_from_channel_and_send_multiple_dest, reshard_assignments,
+        sendmmsg_connected, spawn_send_shard, ConnectedDest, ShardSenderList, ShredMetrics,
+        BATCH_TRACE_ALLOCS,
     };
+
+    /// Permissive logger installed once for the trace-mode tests.
+    /// `log_enabled!(Level::Trace)` short-circuits to `false` whenever no
+    /// logger is installed (the default `NoopLogger::enabled()` returns
+    /// `false`). The test binary doesn't install one — so we provide a
+    /// minimal logger that always reports enabled and discards records.
+    struct AlwaysEnabledLogger;
+    impl log::Log for AlwaysEnabledLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, _: &log::Record) {}
+        fn flush(&self) {}
+    }
+    static ALWAYS_ENABLED_LOGGER: AlwaysEnabledLogger = AlwaysEnabledLogger;
+
+    /// Serializes tests that mutate the process-global `log` crate max-level
+    /// AND lazily installs the permissive test logger on first acquisition.
+    /// Cargo runs `#[test]` items in parallel by default, and `log_enabled!`
+    /// reads a shared atomic — tests that flip the level would race without
+    /// this guard. `set_logger` may only be called once per process; we
+    /// swallow the second-call error.
+    fn log_level_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = log::set_logger(&ALWAYS_ENABLED_LOGGER);
+        guard
+    }
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
         loop {
-            listen_socket.recv(&mut buf).unwrap();
-            received_packets.lock().unwrap().push(Vec::from(buf));
+            match listen_socket.recv(&mut buf) {
+                Ok(_) => received_packets.lock().unwrap().push(Vec::from(buf)),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Bind a UDP listener on `127.0.0.1` at an OS-assigned port. Returns
+    /// the bound socket and its concrete `local_addr()`. Used by the tests
+    /// to avoid hard-coded ports which conflict under parallel `cargo test`.
+    fn bind_listener() -> (UdpSocket, SocketAddr) {
+        let s = UdpSocket::bind("127.0.0.1:0").expect("bind listener");
+        let addr = s.local_addr().expect("local_addr");
+        (s, addr)
+    }
+
+    /// Build a `ConnectedDest` whose socket is `connect()`-ed to `addr`.
+    /// Mirrors what `reshard_assignments` would do for one destination.
+    fn make_connected_dest(addr: SocketAddr) -> ConnectedDest {
+        let sock = new_connected_socket(&addr).expect("bind + connect");
+        ConnectedDest {
+            addr,
+            socket: Arc::new(sock),
         }
     }
 
     #[test]
     fn test_2shreds_3destinations() {
+        // Engage trace mode so the coordinator builds a BatchTrace and the
+        // shard runs the e2e barrier block. The lock keeps this test from
+        // racing with other tests that toggle the log level.
+        let _guard = log_level_lock();
+        log::set_max_level(LevelFilter::Trace);
+
         let packet_batch = PacketBatch::new(vec![
             Packet::new(
                 [1; PACKET_DATA_SIZE],
                 Meta {
                     size: PACKET_DATA_SIZE,
                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    port: 48289, // received on random port
+                    port: 48289,
                     flags: PacketFlags::empty(),
                 },
             ),
@@ -1207,42 +1599,33 @@ mod tests {
         let (packet_sender, packet_receiver) = crossbeam_channel::unbounded::<PacketBatch>();
         packet_sender.send(packet_batch).unwrap();
 
-        let dest_socketaddrs = vec![
-            SocketAddr::from_str("0.0.0.0:32881").unwrap(),
-            SocketAddr::from_str("0.0.0.0:33881").unwrap(),
-            SocketAddr::from_str("0.0.0.0:34881").unwrap(),
-        ];
-
-        let test_listeners = dest_socketaddrs
-            .iter()
-            .map(|socketaddr| {
-                (
-                    UdpSocket::bind(socketaddr).unwrap(),
-                    *socketaddr,
-                    // store results in vec of packet, where packet is Vec<u8>
-                    Arc::new(Mutex::new(vec![])),
-                )
+        // Bind 3 listeners on ephemeral ports so parallel test runs don't
+        // collide on hard-coded port numbers.
+        let listeners: Vec<(UdpSocket, SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>)> = (0..3)
+            .map(|_| {
+                let (s, a) = bind_listener();
+                (s, a, Arc::new(Mutex::new(Vec::new())))
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        // spawn listeners
-        test_listeners
-            .iter()
-            .for_each(|(listen_socket, _socketaddr, to_receive)| {
-                let socket = listen_socket.try_clone().unwrap();
-                let to_receive = to_receive.to_owned();
-                thread::spawn(move || listen_and_collect(socket, to_receive));
-            });
+        let dest_addrs: Vec<SocketAddr> = listeners.iter().map(|(_, a, _)| *a).collect();
 
-        // Spawn ONE send shard, assign all 3 dests to it (so the shard
-        // fans out to all of them in one batch_send), and publish the
-        // sender snapshot.
+        // Spawn listener threads.
+        for (listen_socket, _, to_receive) in &listeners {
+            let socket = listen_socket.try_clone().unwrap();
+            let to_receive = to_receive.to_owned();
+            thread::spawn(move || listen_and_collect(socket, to_receive));
+        }
+
+        // Spawn ONE send shard, populate its assignment with `ConnectedDest`s
+        // pointing at the listeners, and publish the sender snapshot.
         let metrics = Arc::new(ShredMetrics::default());
         let exit = Arc::new(AtomicBool::new(false));
         let shard = spawn_send_shard(0, metrics.clone(), exit.clone());
-        shard
-            .assignment
-            .store(Arc::new(dest_socketaddrs.clone()));
+        let connected: Vec<ConnectedDest> =
+            dest_addrs.iter().copied().map(make_connected_dest).collect();
+        shard.assignment.store(Arc::new(connected));
+
         let shard_senders: ShardSenderList = vec![shard.sender.clone()];
         let shard_senders = ArcSwap::from_pointee(shard_senders);
 
@@ -1261,35 +1644,270 @@ mod tests {
         )
         .unwrap();
 
-        // allow packets to be received
+        // Give the shard time to drain its channel and let the kernel
+        // deliver to the listeners.
         sleep(Duration::from_millis(500));
 
-        let received = test_listeners
-            .iter()
-            .map(|(_, _, results)| results.clone())
-            .collect::<Vec<_>>();
-
-        // check results
-        for received in received.iter() {
-            let received = received.lock().unwrap();
-            assert_eq!(received.len(), 2);
-            assert!(received
-                .iter()
-                .all(|packet| packet.len() == PACKET_DATA_SIZE));
-            assert_eq!(received[0], [1; PACKET_DATA_SIZE]);
-            assert_eq!(received[1], [2; PACKET_DATA_SIZE]);
+        // Check each listener got both packets in order.
+        for (_, _, results) in &listeners {
+            let got = results.lock().unwrap();
+            assert_eq!(got.len(), 2, "listener got wrong number of packets");
+            assert!(got.iter().all(|p| p.len() == PACKET_DATA_SIZE));
+            assert_eq!(got[0], [1; PACKET_DATA_SIZE]);
+            assert_eq!(got[1], [2; PACKET_DATA_SIZE]);
         }
+        let total: usize = listeners
+            .iter()
+            .map(|(_, _, r)| r.lock().unwrap().len())
+            .sum();
+        assert_eq!(total, 6, "expected 2 packets × 3 dests = 6");
 
+        // E2E barrier metric: exactly one batch went through the pipeline,
+        // and the single shard decremented the counter to 0 → recorded once.
         assert_eq!(
-            received
-                .iter()
-                .fold(0, |acc, elem| elem.lock().unwrap().len() + acc),
-            6
+            metrics.e2e_batches.load(Ordering::Relaxed),
+            1,
+            "e2e barrier should fire exactly once per batch"
+        );
+        assert!(
+            metrics.e2e_us_sum.load(Ordering::Relaxed) > 0,
+            "e2e_us_sum should be > 0"
+        );
+        assert!(
+            metrics.e2e_us_max.load(Ordering::Relaxed) > 0,
+            "e2e_us_max should be > 0"
         );
 
-        // Signal the shard to exit and join it. Drop both sender copies so
-        // its `try_recv` sees `Disconnected` (the exit flag also breaks the
-        // busy-spin loop independently).
+        // Cleanly shut down the shard.
+        exit.store(true, Ordering::Relaxed);
+        drop(shard_senders);
+        drop(shard.sender);
+        shard.join.join().unwrap();
+    }
+
+    /// Verify that destinations surviving a reshard keep their existing
+    /// `Arc<UdpSocket>` — i.e. the connected-socket cache is doing its job.
+    /// This is the property that makes connect()'s kernel route cache stay
+    /// warm across reconciles.
+    #[test]
+    fn test_connected_socket_reshard_reuses_existing() {
+        let metrics = Arc::new(ShredMetrics::default());
+        let exit = Arc::new(AtomicBool::new(false));
+        let shard = spawn_send_shard(99, metrics.clone(), exit.clone());
+
+        // Build the unioned_dest_sockets ArcSwap in the same shape the
+        // shard manager would. The first reshard creates fresh sockets;
+        // the second reshard tests reuse semantics.
+        let (_listener_a, addr_a) = bind_listener();
+        let (_listener_b, addr_b) = bind_listener();
+        let (_listener_c, addr_c) = bind_listener();
+
+        let unioned = ArcSwap::from_pointee(vec![addr_a, addr_b]);
+        let mut shards = vec![shard];
+
+        // First reshard — populates the cache.
+        reshard_assignments(&unioned, &mut shards, &metrics);
+        let assignment_1 = shards[0].assignment.load();
+        assert_eq!(assignment_1.len(), 2, "should have 2 dests after first reshard");
+        let old_b_socket = assignment_1
+            .iter()
+            .find(|d| d.addr == addr_b)
+            .expect("B should be in first assignment")
+            .socket
+            .clone();
+        let old_a_socket = assignment_1
+            .iter()
+            .find(|d| d.addr == addr_a)
+            .expect("A should be in first assignment")
+            .socket
+            .clone();
+        drop(assignment_1);
+
+        // Drop addr_a, add addr_c. addr_b stays — its socket should survive
+        // by Arc::ptr_eq.
+        unioned.store(Arc::new(vec![addr_b, addr_c]));
+        reshard_assignments(&unioned, &mut shards, &metrics);
+
+        let assignment_2 = shards[0].assignment.load();
+        assert_eq!(assignment_2.len(), 2, "should have 2 dests after second reshard");
+
+        let new_b = assignment_2
+            .iter()
+            .find(|d| d.addr == addr_b)
+            .expect("B should survive reshard")
+            .socket
+            .clone();
+        assert!(
+            Arc::ptr_eq(&old_b_socket, &new_b),
+            "B's socket Arc should be reused across reshard"
+        );
+
+        // A's socket should NOT be reused (A is gone). We can't directly
+        // assert "absence from cache" because the cache is private, but we
+        // can check that no `ConnectedDest` in the new assignment carries
+        // A's socket pointer (since A isn't in the new assignment at all).
+        let any_uses_old_a = assignment_2
+            .iter()
+            .any(|d| Arc::ptr_eq(&d.socket, &old_a_socket));
+        assert!(!any_uses_old_a, "A's old socket should have been dropped");
+        drop(assignment_2);
+
+        // Tear down.
+        exit.store(true, Ordering::Relaxed);
+        for s in shards.drain(..) {
+            drop(s.sender);
+            s.join.join().unwrap();
+        }
+    }
+
+    /// Bind a listener, connect a sender to it, push 4 distinct payloads
+    /// through `sendmmsg_connected`. Assert all 4 land on the listener side.
+    /// Covers the Linux `sendmmsg(2)` path and the non-Linux fallback.
+    #[test]
+    fn test_sendmmsg_connected_delivers_all_packets() {
+        let (listener, listener_addr) = bind_listener();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let sender = new_connected_socket(&listener_addr).expect("bind+connect sender");
+
+        // Distinct fixed-size payloads so we can tell them apart on recv.
+        let payloads: Vec<Vec<u8>> =
+            (1u8..=4).map(|i| vec![i; PACKET_DATA_SIZE]).collect();
+        let pkt_refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+
+        let sent = sendmmsg_connected(&sender, &pkt_refs).expect("sendmmsg_connected ok");
+        assert_eq!(sent, 4, "should have sent all 4 packets");
+
+        // Receive 4 packets, collect, then verify the SET matches (order is
+        // not guaranteed across kernels though Linux is FIFO for single fd).
+        let mut got: Vec<Vec<u8>> = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let mut buf = [0u8; PACKET_DATA_SIZE];
+            let n = listener.recv(&mut buf).expect("recv");
+            assert_eq!(n, PACKET_DATA_SIZE);
+            got.push(buf.to_vec());
+        }
+        for expected in &payloads {
+            assert!(
+                got.iter().any(|g| g == expected),
+                "missing payload starting with byte {}",
+                expected[0]
+            );
+        }
+    }
+
+    /// With trace OFF, the coordinator must not allocate a `BatchTrace`
+    /// and the e2e metrics must stay at zero. Flipping trace ON should
+    /// allocate exactly one trace and record one e2e datapoint.
+    #[test]
+    fn test_trace_off_zero_overhead_no_batch_trace_alloc() {
+        let _guard = log_level_lock();
+        // Use a separate listener+shard from the other tests to keep
+        // metrics isolated.
+        let (_listener, addr) = bind_listener();
+        let metrics = Arc::new(ShredMetrics::default());
+        let exit = Arc::new(AtomicBool::new(false));
+        let shard = spawn_send_shard(7, metrics.clone(), exit.clone());
+        shard
+            .assignment
+            .store(Arc::new(vec![make_connected_dest(addr)]));
+        let shard_senders: ShardSenderList = vec![shard.sender.clone()];
+        let shard_senders = ArcSwap::from_pointee(shard_senders);
+        let deduper = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
+            &mut rand::thread_rng(),
+            crate::forwarder::DEDUPER_NUM_BITS,
+        )));
+        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
+
+        let make_batch = || {
+            PacketBatch::new(vec![Packet::new(
+                [9; PACKET_DATA_SIZE],
+                Meta {
+                    size: PACKET_DATA_SIZE,
+                    addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port: 1234,
+                    flags: PacketFlags::empty(),
+                },
+            )])
+        };
+
+        // ---- trace OFF: no allocations expected, no e2e increment.
+        log::set_max_level(LevelFilter::Info);
+        let allocs_before = BATCH_TRACE_ALLOCS.load(Ordering::Relaxed);
+
+        let (tx_off, rx_off) = crossbeam_channel::unbounded::<PacketBatch>();
+        tx_off.send(make_batch()).unwrap();
+        recv_from_channel_and_send_multiple_dest(
+            rx_off.recv(),
+            &deduper,
+            &shard_senders,
+            true,
+            &reconstruct_tx,
+            false,
+            &metrics,
+        )
+        .unwrap();
+        sleep(Duration::from_millis(50));
+
+        let allocs_after_off = BATCH_TRACE_ALLOCS.load(Ordering::Relaxed);
+        assert_eq!(
+            allocs_after_off, allocs_before,
+            "trace OFF must not allocate any BatchTrace"
+        );
+        assert_eq!(
+            metrics.e2e_batches.load(Ordering::Relaxed),
+            0,
+            "trace OFF must not record any e2e batches"
+        );
+
+        // ---- trace ON: exactly one alloc, exactly one e2e batch recorded.
+        log::set_max_level(LevelFilter::Trace);
+
+        // Fresh deduper to avoid the second identical batch being dropped.
+        let deduper_on = Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
+            &mut rand::thread_rng(),
+            crate::forwarder::DEDUPER_NUM_BITS,
+        )));
+        let (tx_on, rx_on) = crossbeam_channel::unbounded::<PacketBatch>();
+        // Use a different payload so dedup doesn't accidentally drop.
+        tx_on
+            .send(PacketBatch::new(vec![Packet::new(
+                [11; PACKET_DATA_SIZE],
+                Meta {
+                    size: PACKET_DATA_SIZE,
+                    addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port: 1234,
+                    flags: PacketFlags::empty(),
+                },
+            )]))
+            .unwrap();
+        recv_from_channel_and_send_multiple_dest(
+            rx_on.recv(),
+            &deduper_on,
+            &shard_senders,
+            true,
+            &reconstruct_tx,
+            false,
+            &metrics,
+        )
+        .unwrap();
+        sleep(Duration::from_millis(100));
+
+        let allocs_after_on = BATCH_TRACE_ALLOCS.load(Ordering::Relaxed);
+        assert_eq!(
+            allocs_after_on - allocs_after_off,
+            1,
+            "trace ON must allocate exactly one BatchTrace per batch"
+        );
+        assert_eq!(
+            metrics.e2e_batches.load(Ordering::Relaxed),
+            1,
+            "trace ON must record exactly one e2e batch"
+        );
+
+        // Clean shutdown.
         exit.store(true, Ordering::Relaxed);
         drop(shard_senders);
         drop(shard.sender);

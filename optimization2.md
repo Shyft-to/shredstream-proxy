@@ -164,6 +164,70 @@ These were in the earlier catalog and are **not** worth pursuing:
 
 ---
 
+## Implemented — Run 7 (2026-05-16): Strategy 3 sharded busy-spin pool
+
+**What shipped.** Replaced the D per-destination worker tier with a fixed-size
+pool of N busy-spinning send shards. Each shard owns a slice of the
+destination set via an `ArcSwap<Vec<SocketAddr>>`; the shard-manager
+reconciles on the 5-second tick by recomputing a round-robin assignment and
+publishing it with one atomic store per shard. Shards spawn once at startup
+and never churn. Coordinator dispatch goes from D channel sends (27) to N
+channel sends (8).
+
+**Key code points (`proxy/src/forwarder.rs`):**
+
+- `compute_send_shards()` — `(available_parallelism / 4).clamp(2, 16)` →
+  N = 8 on the 32-core production host. Heuristic: leaves ~24 cores for
+  everything else, and at D≈27 happens to coincide with the latency
+  optimum from `N_opt = √(D · t_datagram / t_wake)`.
+- `spawn_send_shard` / `run_send_shard` — busy-spin (`try_recv` +
+  `std::hint::spin_loop()`), no `recv_timeout`, no parking. Each shard
+  loads its assignment via `ArcSwap::load`, builds a reused scratch
+  `Vec<(&[u8], &SocketAddr)>`, issues one `batch_send` (sendmmsg) per
+  Arc'd PacketBatch.
+- `reshard_assignments` — round-robin (stride N) instead of contiguous
+  slicing, to spread heterogeneous destinations. Single atomic store
+  per shard publishes the new slice without coordinating with the spinners.
+- IPv4-only constraint kept (single shared `0.0.0.0:0` socket per shard);
+  IPv6 destinations are skipped with a warn-once guard.
+
+**What it solved.**
+
+- `avg_fanout_dispatch_us`: ~30 µs → **~0 µs** (8 channel sends are
+  sub-microsecond; the metric rounds down to 0).
+- `avg_total_us`: ~33 µs → **~2 µs**. The coordinator path is now
+  essentially `recv + dedup` — fanout is free.
+- End-to-end (`avg_total + avg_worker_send`): ~39 µs → **~19 µs**
+  (~50 % reduction). Matches the cost-model prediction for N=8, D=27,
+  `t_datagram=4 µs`: `2 + (2 + 3.4·4) ≈ 17.6 µs`.
+- **Tail latency dropped 4–10×** vs Run 6's per-dest busy-spin:
+  - `max_worker_send_us`: ~3000–6000 µs → **~900–1300 µs**.
+  - `max_total_us`: ~1448 µs avg → **~139 µs avg**.
+  - Root cause: Run 6 had 27 spinners on a 32-core box (oversubscribed).
+    Run 7 has 8 spinners — plenty of headroom for OS, IRQ, coordinator,
+    listener.
+- CPU burn dropped from ~27 cores pinned → **~8 cores pinned**.
+
+**Trade-offs and known weak spots.**
+
+- `compute_send_shards()` doesn't depend on D or `t_datagram` — it's a
+  CPU-budget heuristic, not a derived optimum. Works because /4 lands at
+  N=8 on a 32-core host which coincides with the latency optimum for the
+  current workload. Will need re-tuning once connected sockets land
+  (`t_datagram` drops → optimum shifts to N≈5).
+- `avg_dests_per_batch` semantics changed: now counts shard sends (N),
+  not destinations (D). `worker_count` still reports D for dashboard
+  continuity. Documented in the dashboard Run 7 entry.
+- Sends within a shard are still serial in kernel (~3.4 dests ×
+  `t_datagram`). This is the next ceiling — only connected sockets
+  shrink it.
+
+**Status of the bundled "step 1" plan.** Half done. Sharded pool ✓;
+connected sockets pending. The remaining ~7 µs gap to the projected
+~17 µs floor lives entirely in the per-shard `sendmmsg` call.
+
+---
+
 ## Realistic latency floor (from this code path)
 
 Steps 1+2 plausibly land **~17 µs end-to-end**, down from ~39 µs (~55 %).

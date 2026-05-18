@@ -138,31 +138,34 @@ Recv → dedup → stats → dispatch pipeline running in `ssPxyTx_<i>` threads.
 |---|---|
 | `batches` | Coordinator batches handled this interval |
 | `packets` | Total packets across all batches (use to derive packets/sec) |
-| `dest_sends` | Σ destination count across batches (fanout multiplier × batches) |
-| `worker_count` | Active per-destination worker threads at emission time |
-| `worker_dropped_batches` | Batches dropped because a worker's channel was full — backpressure indicator |
+| `dest_sends` | Σ destination count across batches (fanout multiplier × batches). With the sharded pool this counts SHARD dispatches (N), not destinations (D). |
+| `worker_count` | Destination count D at emission time (kept under historical field name for dashboard continuity; the actual thread count is N from `compute_send_shards`) |
+| `worker_dropped_batches` | Coordinator try_send failures because a shard's channel was full — backpressure indicator |
 | `avg_packets_per_batch` | `packets / batches` |
-| `avg_dests_per_batch` | `dest_sends / batches` |
-| `avg_total_us` | Avg time in coordinator per batch (recv → dispatch return) |
+| `avg_dests_per_batch` | `dest_sends / batches` (shards per batch under the sharded pool) |
+| `avg_total_us` | Avg time in coordinator per batch (recv → dispatch return). **Diagnostic only** — does NOT include the actual UDP send. Use `avg_end_to_end_us` for the headline number. |
 | `avg_dedup_us` | Avg time spent in the dedup bloom filter |
 | `avg_stats_us` | Avg time updating per-source stats DashMap |
 | `avg_reconstruct_clone_us` | Avg time cloning batch + try_send for the gRPC reconstruct path |
-| `avg_fanout_dispatch_us` | Avg time dispatching Arc clones to all D worker channels (now sub-µs; UDP send happens in workers) |
+| `avg_fanout_dispatch_us` | Avg time dispatching Arc clones to all N shard channels (sub-µs; UDP send happens in shards) |
 | `max_total_us` | Slowest coordinator pass observed this interval |
-| `max_fanout_dispatch_us` | Slowest dispatch pass observed this interval |
+| `max_fanout_dispatch_us` | Slowest dispatch pass observed this interval. A spike here without `max_end_to_end_us` rising tracks a shard channel temporarily full. |
+| `e2e_batches` | Number of batches that completed the end-to-end barrier (every shard for that batch finished its `sendmmsg`). In steady state ≈ `batches`. |
+| `avg_end_to_end_us` | **Canonical end-to-end latency** — average wall-clock from `recv` returning to the last shard's `sendmmsg` returning for the same batch. The number to compare across optimizations. |
+| `max_end_to_end_us` | Slowest single-batch end-to-end observed. Tail metric. |
 
 #### `shredstream_proxy-worker_perf` — per-destination UDP send workers
 
-Running in `ssPxyDst_<ip>_<port>` threads. Each row is an aggregate across
-all workers; per-destination breakdown is not currently tagged.
+Running in `ssPxyShard_<i>` threads. Each row is an aggregate across all
+shards; per-shard breakdown is not currently tagged.
 
 | Field | Meaning |
 |---|---|
-| `worker_batches` | Σ batches processed across all workers this interval |
-| `worker_packets_sent` | Σ packets sent across all workers (≈ `success_forward`) |
-| `avg_worker_send_us` | Avg `sendmmsg` wall-clock per worker per batch — **the per-destination UDP send cost** |
-| `max_worker_send_us` | Slowest worker send observed — the tail-latency number |
-| `avg_worker_packets_per_batch` | Packets per worker batch |
+| `worker_batches` | Σ batches processed across all shards this interval |
+| `worker_packets_sent` | Σ packets sent across all shards (≈ `success_forward`) |
+| `avg_worker_send_us` | Avg `sendmmsg` wall-clock per shard per batch — sum across the shard's D/N connected-socket sends. **The per-shard UDP send cost.** |
+| `max_worker_send_us` | Slowest per-shard send observed — the tail-latency number |
+| `avg_worker_packets_per_batch` | Packets per shard batch |
 
 > **Why one knob (`forwarder=trace`) controls a datapoint emitted at INFO?**
 > The trace level is used as a zero-overhead gate — when off, no
@@ -179,11 +182,12 @@ downstream.
 
 | Improvement claim | Metric to compare before/after |
 |---|---|
-| Last-destination latency no longer scales with D | `max_worker_send_us` (should stay near `avg_worker_send_us` regardless of `worker_count`) |
-| Coordinator is no longer the bottleneck | `avg_total_us`, `max_total_us` (drops dramatically — no D-way send loop in coordinator) |
-| Channel dispatch is essentially free | `avg_fanout_dispatch_us` (now sub-µs even at D=100) |
-| Per-destination send cost in isolation | `avg_worker_send_us` (sendmmsg wall-clock for P packets to one dest) |
-| Slow destination detection | `worker_dropped_batches > 0` (a worker fell behind and lost batches) |
+| **End-to-end latency** (the headline number) | `avg_end_to_end_us`, `max_end_to_end_us` (recv→last-shard-sendmmsg-returned, full pipeline) |
+| Last-destination latency no longer scales with D | `max_end_to_end_us` (should stay flat as D grows; was `max_worker_send_us` in older runs) |
+| Coordinator is no longer the bottleneck | `avg_total_us`, `max_total_us` (diagnostic — coordinator path only) |
+| Channel dispatch is essentially free | `avg_fanout_dispatch_us` (sub-µs at N=8 shards) |
+| Per-shard send cost in isolation | `avg_worker_send_us` (sum of sendmmsg across D/N connected sockets per shard per batch) |
+| Slow shard / backpressure detection | `worker_dropped_batches > 0` (coordinator's try_send to a shard failed) |
 | Throughput | `packets` / interval, `worker_packets_sent` / interval |
 
 ### Forwarder architecture (post-optimization)
@@ -192,21 +196,46 @@ The forwarder is split into two thread tiers:
 
 1. **Coordinator threads** (one per listener socket, named `ssPxyTx_<i>`):
    receive `PacketBatch` from the listener, dedup, update per-source stats,
-   wrap in `Arc<PacketBatch>`, and dispatch to per-destination workers via
-   bounded crossbeam channels. No UDP I/O happens here.
-2. **Per-destination worker threads** (one per active destination, named
-   `ssPxyDst_<ip>_<port>`): own a `UdpSocket`, receive `Arc<PacketBatch>`,
-   build a reused scratch `Vec<(&[u8], &SocketAddr)>`, and call `batch_send`
-   (= `sendmmsg(2)` on Linux — one syscall for up to 1024 packets).
+   wrap in `Arc<PacketBatch>`, and dispatch to the **fixed-size send-shard
+   pool** via bounded crossbeam channels. No UDP I/O happens here.
+2. **Send-shard threads** (N busy-spinning threads, named `ssPxyShard_<i>`,
+   where N comes from `compute_send_shards()` — `available_parallelism()/4`
+   clamped to `[2, 16]`): each owns its slice of destinations as
+   `ConnectedDest { addr, socket: Arc<UdpSocket> }`. For every batch the
+   shard issues one `sendmmsg(2)` per destination on its **connected** UDP
+   socket — `msg_name = NULL`, so the kernel skips the per-datagram route
+   lookup (cached on `connect()`).
 
-A **dest-manager thread** (`ssPxyDstMgr`) polls the destination list every 5s
-and spawns/drops workers as destinations are added/removed.
+A **shard-manager thread** (`ssPxyShardMgr`) spawns the N shards once at
+startup and runs a 5-second reconcile tick. On each tick it re-shards
+the destination list round-robin across the N shards and refreshes each
+shard's per-destination socket cache: destinations that survive a reshard
+keep their existing connected `UdpSocket` (route cache stays warm); new
+destinations get a fresh `bind() + connect()`; removed destinations have
+their sockets closed.
 
 End-to-end latency for the slowest destination no longer scales linearly
-with the number of destinations — sends happen in parallel, so latency is
-`max(T_per_dest)` rather than `sum(T_per_dest)`. Watch `avg_worker_send_us`
-and `max_worker_send_us` to measure the per-destination UDP cost in
-isolation.
+with D — sends happen in parallel across the N shards, so latency is
+`max(T_per_shard)` rather than `sum(T_per_dest)`. The canonical metric is
+`avg_end_to_end_us`, which captures the full pipeline including the
+slowest shard's per-destination `sendmmsg` chain.
+
+**File-descriptor usage.** Each shard holds one connected `UdpSocket` per
+destination in its slice. Total FDs ≈ D (slightly higher because of
+listener sockets, the gRPC service path if enabled, etc.). Default
+`ulimit -n` is fine for D up to ~500. For larger destination sets, raise
+the limit in your service unit:
+
+```ini
+[Service]
+LimitNOFILE=4096
+```
+
+**Connected sockets and `t_datagram`.** `connect()` on a UDP socket caches
+the route lookup and next-hop on the socket. Subsequent `sendmmsg(2)`
+calls skip those steps, dropping the per-datagram in-kernel cost from
+~4 µs to ~1 µs. The visible effect is a 5–10 µs drop in
+`avg_end_to_end_us` after this change deploys.
 
 ### Extracting for the HTML dashboard
 
