@@ -1199,6 +1199,7 @@ mod tests {
     };
 
     use arc_swap::ArcSwap;
+    use log::LevelFilter;
     use solana_perf::{
         deduper::Deduper,
         packet::{Meta, Packet, PacketBatch},
@@ -1208,6 +1209,28 @@ mod tests {
     use crate::forwarder::{
         recv_from_channel_and_send_multiple_dest, spawn_dest_worker, DestSenderMap, ShredMetrics,
     };
+
+    /// Permissive logger so `log_enabled!(Level::Trace)` returns true in the
+    /// trace-gated metric paths. Without an installed logger the default
+    /// NoopLogger reports `enabled() == false`, so the e2e barrier would
+    /// never run and the metric assertions below would be vacuous.
+    struct AlwaysEnabledLogger;
+    impl log::Log for AlwaysEnabledLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, _: &log::Record) {}
+        fn flush(&self) {}
+    }
+    static ALWAYS_ENABLED_LOGGER: AlwaysEnabledLogger = AlwaysEnabledLogger;
+
+    /// Install the permissive logger once and raise the level to Trace so the
+    /// e2e barrier path is exercised. `set_logger` may only succeed once per
+    /// process; the error on subsequent calls is swallowed.
+    fn enable_trace_metrics() {
+        let _ = log::set_logger(&ALWAYS_ENABLED_LOGGER);
+        log::set_max_level(LevelFilter::Trace);
+    }
 
     fn listen_and_collect(listen_socket: UdpSocket, received_packets: Arc<Mutex<Vec<Vec<u8>>>>) {
         let mut buf = [0u8; PACKET_DATA_SIZE];
@@ -1219,6 +1242,11 @@ mod tests {
 
     #[test]
     fn test_2shreds_3destinations() {
+        // Engage trace mode so the coordinator builds a BatchTrace and the
+        // workers run the e2e barrier block. Lets the assertions at the end
+        // verify the e2e metric actually records.
+        enable_trace_metrics();
+
         let packet_batch = PacketBatch::new(vec![
             Packet::new(
                 [1; PACKET_DATA_SIZE],
@@ -1321,6 +1349,23 @@ mod tests {
                 .iter()
                 .fold(0, |acc, elem| elem.lock().unwrap().len() + acc),
             6
+        );
+
+        // E2E barrier metric: exactly one batch traversed the pipeline, so
+        // the barrier must have fired exactly once (the last of the 3 workers
+        // to finish recorded it), with a non-zero elapsed time.
+        assert_eq!(
+            metrics.e2e_batches.load(Ordering::Relaxed),
+            1,
+            "e2e barrier should fire exactly once per batch under trace"
+        );
+        assert!(
+            metrics.e2e_us_sum.load(Ordering::Relaxed) > 0,
+            "e2e_us_sum should be > 0"
+        );
+        assert!(
+            metrics.e2e_us_max.load(Ordering::Relaxed) > 0,
+            "e2e_us_max should be > 0"
         );
 
         // Signal workers to exit and join.
