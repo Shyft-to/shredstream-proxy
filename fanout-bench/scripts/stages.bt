@@ -28,7 +28,7 @@ tracepoint:net:netif_receive_skb
 		if (*(uint8 *)($ip + 9) == 17) {
 			$ihl = (*(uint8 *)$ip & 0xf) * 4;
 			$dport = *(uint16 *)($ip + $ihl + 2);
-			if ($dport == ((($2 & 0xff) << 8) | (($2 >> 8) & 0xff))) {
+			if ((uint64)$dport == (uint64)((($2 & 0xff) << 8) | (($2 >> 8) & 0xff))) {
 				@rx[(uint64)$skb] = nsecs;
 			}
 		}

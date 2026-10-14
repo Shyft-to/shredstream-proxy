@@ -85,10 +85,39 @@ builds. Supported by the long dispatch runs above, but not proven.
   a reboot). Mitigation changes trade security for speed and are not
   proposed.
 
+## Update, same day: kernel receive path and load
+
+Second run on 23998 (~9.2k shreds/s), with two new measurements.
+
+**Kernel receive path is fast.** From the kernel seeing the packet to it
+being queued on the socket (S0): typically 2–8 µs, average 4.4 µs. The
+hypothesis above that this path hides 30–40 µs is **rejected**.
+
+**Latency depends strongly on load: queueing is the main cause of the
+tail.** Shreds grouped by how many shreds arrived in the 500 µs before them:
+
+| Recent arrivals | Shreds | Completion p50 | Completion p99 | First dest p50 |
+|---|---|---|---|---|
+| 0–5 | 12% | 67–78 µs | 485–845 µs | 35–43 µs |
+| 6 or more | 86% | 332 µs | 3,873 µs | 119 µs |
+
+- With little recent traffic, the current design delivers to all 15
+  destinations in ~70 µs (p50). That is its floor.
+- Under normal load (most shreds) the same forwarder is ~4.5× slower at
+  p50 and ~5–8× slower at p99. The work per shred did not change, so the
+  extra time is spent waiting behind earlier shreds.
+- **[Hypothesis]** The queue forms mainly at the coordinator's serial
+  worker wakeups. Supported by the long dispatch runs, not yet isolated.
+
+The 500 µs window put 86% of shreds in one bucket; the breakdown now uses
+finer buckets (up to 32+) to show how latency grows with load.
+
 ## Next
 
 - Record a corpus and set up the lab test bed, so candidate changes can be
   compared on identical traffic.
+- Measure the existing busy-spin experiment (branch `opt_1_1`: sharded
+  non-sleeping senders, connected sockets) with the north star in the lab.
 - Check the firewall rules to see whether forwarder traffic can skip
   conntrack.
 - Prototype the two candidate designs (pinned non-sleeping sender threads;

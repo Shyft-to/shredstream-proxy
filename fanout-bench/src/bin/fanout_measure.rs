@@ -166,14 +166,22 @@ struct DestResult {
 
 #[derive(Serialize)]
 struct LoadBucket {
-    /// Shreds that arrived in the load window before this one ("6+" = 6 or more).
+    /// Shreds that arrived in the load window before this one, e.g. "8-11" or "32+".
     recent_arrivals: String,
     completion: Summary,
     first_dest: Summary,
 }
 
-/// Largest "recent arrivals" bucket; everything above it is grouped together.
-const LOAD_BUCKETS: usize = 6;
+/// Lower edges of the "recent arrivals" buckets; the last one is open-ended.
+const LOAD_EDGES: [usize; 12] = [0, 1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32];
+
+fn load_bucket_label(i: usize) -> String {
+    match LOAD_EDGES.get(i + 1) {
+        None => format!("{}+", LOAD_EDGES[i]),
+        Some(&next) if next == LOAD_EDGES[i] + 1 => LOAD_EDGES[i].to_string(),
+        Some(&next) => format!("{}-{}", LOAD_EDGES[i], next - 1),
+    }
+}
 
 #[derive(Serialize)]
 struct AnalyzeResult {
@@ -366,17 +374,17 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
     let mut arrivals: Vec<u64> = ingress.values().map(|i| i.first_ns).collect();
     arrivals.sort_unstable();
     let window_ns = a.load_window_us * 1_000;
-    let mut load_completion: Vec<Vec<u64>> = vec![Vec::new(); LOAD_BUCKETS + 1];
-    let mut load_first: Vec<Vec<u64>> = vec![Vec::new(); LOAD_BUCKETS + 1];
+    let mut load_completion: Vec<Vec<u64>> = vec![Vec::new(); LOAD_EDGES.len()];
+    let mut load_first: Vec<Vec<u64>> = vec![Vec::new(); LOAD_EDGES.len()];
     for &(t, worst, best) in &timed {
         let recent = arrivals.partition_point(|&x| x < t) - arrivals.partition_point(|&x| x < t.saturating_sub(window_ns));
-        let b = recent.min(LOAD_BUCKETS);
+        let b = LOAD_EDGES.partition_point(|&edge| edge <= recent) - 1;
         load_completion[b].push(worst);
         load_first[b].push(best);
     }
-    let by_recent_arrivals: Vec<LoadBucket> = (0..=LOAD_BUCKETS)
+    let by_recent_arrivals: Vec<LoadBucket> = (0..LOAD_EDGES.len())
         .map(|b| LoadBucket {
-            recent_arrivals: if b == LOAD_BUCKETS { format!("{b}+") } else { b.to_string() },
+            recent_arrivals: load_bucket_label(b),
             completion: summarize(&mut load_completion[b]),
             first_dest: summarize(&mut load_first[b]),
         })
