@@ -94,6 +94,11 @@ struct AnalyzeArgs {
     /// Number of destinations to list in the per-destination table.
     #[arg(long, default_value_t = 30)]
     show_dests: usize,
+
+    /// Window for the "latency vs recent load" breakdown: each shred is
+    /// grouped by how many shreds arrived in this many µs before it.
+    #[arg(long, default_value_t = 500)]
+    load_window_us: u64,
 }
 
 #[derive(Args)]
@@ -160,6 +165,17 @@ struct DestResult {
 }
 
 #[derive(Serialize)]
+struct LoadBucket {
+    /// Shreds that arrived in the load window before this one ("6+" = 6 or more).
+    recent_arrivals: String,
+    completion: Summary,
+    first_dest: Summary,
+}
+
+/// Largest "recent arrivals" bucket; everything above it is grouped together.
+const LOAD_BUCKETS: usize = 6;
+
+#[derive(Serialize)]
 struct AnalyzeResult {
     label: String,
     unix_time: u64,
@@ -197,6 +213,10 @@ struct AnalyzeResult {
     /// Every (shred, destination) send.
     per_send: Summary,
     per_dest: Vec<DestResult>,
+    load_window_us: u64,
+    /// Latency grouped by how busy the forwarder was just before the shred
+    /// arrived. Rising latency with load means queueing.
+    by_recent_arrivals: Vec<LoadBucket>,
 }
 
 fn shred_key(payload: &[u8], key_bytes: usize, wire_len: usize) -> u64 {
@@ -303,6 +323,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
     let mut per_send = Vec::new();
     let mut completion = Vec::new();
     let mut first_dest = Vec::new();
+    let mut timed: Vec<(u64, u64, u64)> = Vec::new();
     let (mut eligible, mut multi, mut missing, mut dups, mut negative) = (0u64, 0u64, 0u64, 0u64, 0u64);
 
     for (key, ing) in &ingress {
@@ -337,8 +358,29 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         if complete && !active.is_empty() {
             completion.push(worst);
             first_dest.push(best);
+            timed.push((ing.first_ns, worst, best));
         }
     }
+
+    // Latency vs recent load: count arrivals in the window before each shred.
+    let mut arrivals: Vec<u64> = ingress.values().map(|i| i.first_ns).collect();
+    arrivals.sort_unstable();
+    let window_ns = a.load_window_us * 1_000;
+    let mut load_completion: Vec<Vec<u64>> = vec![Vec::new(); LOAD_BUCKETS + 1];
+    let mut load_first: Vec<Vec<u64>> = vec![Vec::new(); LOAD_BUCKETS + 1];
+    for &(t, worst, best) in &timed {
+        let recent = arrivals.partition_point(|&x| x < t) - arrivals.partition_point(|&x| x < t.saturating_sub(window_ns));
+        let b = recent.min(LOAD_BUCKETS);
+        load_completion[b].push(worst);
+        load_first[b].push(best);
+    }
+    let by_recent_arrivals: Vec<LoadBucket> = (0..=LOAD_BUCKETS)
+        .map(|b| LoadBucket {
+            recent_arrivals: if b == LOAD_BUCKETS { format!("{b}+") } else { b.to_string() },
+            completion: summarize(&mut load_completion[b]),
+            first_dest: summarize(&mut load_first[b]),
+        })
+        .collect();
 
     let orphan_egress = egress.keys().filter(|(k, _)| !ingress.contains_key(k)).count();
     let capture_seconds = t_max.saturating_sub(t_min) as f64 / 1e9;
@@ -385,6 +427,8 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         first_dest: summarize(&mut first_dest),
         per_send: summarize(&mut per_send),
         per_dest: dest_results,
+        load_window_us: a.load_window_us,
+        by_recent_arrivals,
     };
 
     print_report(&result, a.show_dests);
@@ -445,6 +489,20 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
     }
     if r.negative_latencies > 0 {
         println!("WARNING: {} sends timestamped before their ingress", r.negative_latencies);
+    }
+    println!(
+        "latency vs recent load (shreds that arrived in the {} us before)",
+        r.load_window_us
+    );
+    println!(
+        "  {:>8} {:>9} {:>16} {:>16} {:>16}",
+        "arrivals", "shreds", "completion p50", "completion p99", "first dest p50"
+    );
+    for b in r.by_recent_arrivals.iter().filter(|b| b.completion.count > 0) {
+        println!(
+            "  {:>8} {:>9} {:>16.1} {:>16.1} {:>16.1}",
+            b.recent_arrivals, b.completion.count, b.completion.p50_us, b.completion.p99_us, b.first_dest.p50_us
+        );
     }
     println!("per destination (slowest p99 first)");
     for d in r.per_dest.iter().take(show_dests) {

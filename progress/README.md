@@ -11,3 +11,4 @@ corrections go into a later chapter.
 | Chapter | Date | Topic |
 |---|---|---|
 | [Chapter 1](chapter-01-2026-10-14-baseline.md) | 2026-10-14 | Server survey, quick fixes, north-star metric, first production baseline |
+| [Chapter 2](chapter-02-2026-10-14-profiling.md) | 2026-10-14 | Stage-by-stage profile of the proxy; ranked bottlenecks |

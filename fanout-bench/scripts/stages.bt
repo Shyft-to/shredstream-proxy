@@ -2,8 +2,8 @@
 /*
  * Stage timings for one jito-shredstream-proxy forward-only process.
  *
- * Follows a shred through the proxy's threads:
- *   packet queued on socket -> receive thread (ssListen*) -> coordinator
+ * Follows a shred through the kernel and the proxy's threads:
+ *   kernel receive -> packet queued on socket -> receive thread (ssListen*) -> coordinator
  *   (ssPxyTx_*) -> one worker per destination (ssPxyDst_*) -> sendmmsg
  *
  * Usage: bpftrace stages.bt PID PORT SECONDS   (run via profile.sh stages)
@@ -18,6 +18,23 @@ BEGIN
 	printf("tracing pid %d, port %d for %d s ...\n", $1, $2, $3);
 }
 
+/* Packet enters the kernel's receive path: the same point where the north-star
+ * clock starts (packet-tap timestamp). Keep only IPv4/UDP to our port. */
+tracepoint:net:netif_receive_skb
+{
+	$skb = (struct sk_buff *)args->skbaddr;
+	if ($skb->protocol == 0x0008) {
+		$ip = $skb->data;
+		if (*(uint8 *)($ip + 9) == 17) {
+			$ihl = (*(uint8 *)$ip & 0xf) * 4;
+			$dport = *(uint16 *)($ip + $ihl + 2);
+			if ($dport == ((($2 & 0xff) << 8) | (($2 >> 8) & 0xff))) {
+				@rx[(uint64)$skb] = nsecs;
+			}
+		}
+	}
+}
+
 /* A packet for our port is queued on the socket. Remember the oldest one the
  * receive thread has not picked up yet. */
 kprobe:__udp_enqueue_schedule_skb
@@ -25,6 +42,13 @@ kprobe:__udp_enqueue_schedule_skb
 	$sk = (struct sock *)arg0;
 	if ($sk->__sk_common.skc_num == $2) {
 		@packets_queued = count();
+		$t = @rx[(uint64)arg1];
+		if ($t) {
+			$d = nsecs - $t;
+			@s0_kernel_receive = hist($d);
+			@s0_kernel_receive_stats = stats($d);
+			delete(@rx[(uint64)arg1]);
+		}
 		if (@oldest == 0) {
 			@oldest = nsecs;
 		}
@@ -164,12 +188,13 @@ interval:s:1
 
 END
 {
-	clear(@mine); clear(@wake); clear(@runq); clear(@recv_done); clear(@tx_run);
+	clear(@rx); clear(@mine); clear(@wake); clear(@runq); clear(@recv_done); clear(@tx_run);
 	clear(@tx_last); clear(@tx_wakes); clear(@w_run); clear(@send_start);
 	clear(@oldest); clear(@elapsed);
 
 	printf("\n===== SUMMARY (count, average ns) =====\n");
 	print(@packets_queued);
+	print(@s0_kernel_receive_stats);
 	print(@s1_socket_wait_stats);
 	print(@s2_receiver_wakeup_stats);
 	print(@s3_receive_to_coordinator_wake_stats);
@@ -184,6 +209,8 @@ END
 	print(@runq_worker_stats);
 
 	printf("\n===== HISTOGRAMS (ns) =====\n");
+	printf("\nS0 kernel sees packet -> queued on socket\n");
+	print(@s0_kernel_receive);
 	printf("\nS1 oldest queued packet -> receive thread has it\n");
 	print(@s1_socket_wait);
 	printf("\nS2 receive thread woken -> back in userspace\n");
@@ -211,6 +238,7 @@ END
 	print(@runq_worker);
 
 	clear(@packets_queued);
+	clear(@s0_kernel_receive); clear(@s0_kernel_receive_stats);
 	clear(@s1_socket_wait); clear(@s1_socket_wait_stats);
 	clear(@s2_receiver_wakeup); clear(@s2_receiver_wakeup_stats);
 	clear(@s3_receive_to_coordinator_wake); clear(@s3_receive_to_coordinator_wake_stats);
