@@ -61,6 +61,7 @@ network device. Reported at p99 over all shreds in the window.
 |---|---|
 | `scripts/testbed.sh` | Isolated lab in three network namespaces. Never touches the host network. |
 | `scripts/probe.sh` | Production: passive north-star measurement of a live instance, and corpus capture. |
+| `scripts/profile.sh` | Profiling a live instance: per-stage latency histograms (`stages`, via `stages.bt`) and CPU by function (`cpu`, via `perf`). |
 
 ## Workflow
 

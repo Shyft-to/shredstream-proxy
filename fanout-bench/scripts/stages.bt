@@ -1,0 +1,228 @@
+#!/usr/bin/env bpftrace
+/*
+ * Stage timings for one jito-shredstream-proxy forward-only process.
+ *
+ * Follows a shred through the proxy's threads:
+ *   packet queued on socket -> receive thread (ssListen*) -> coordinator
+ *   (ssPxyTx_*) -> one worker per destination (ssPxyDst_*) -> sendmmsg
+ *
+ * Usage: bpftrace stages.bt PID PORT SECONDS   (run via profile.sh stages)
+ *
+ * All values are nanoseconds; in histograms "8K" means 8 us.
+ * Wakeup stages are measured only when the thread was actually asleep, which
+ * is the common case for this proxy (its threads idle ~95% of the time).
+ */
+
+BEGIN
+{
+	printf("tracing pid %d, port %d for %d s ...\n", $1, $2, $3);
+}
+
+/* A packet for our port is queued on the socket. Remember the oldest one the
+ * receive thread has not picked up yet. */
+kprobe:__udp_enqueue_schedule_skb
+{
+	$sk = (struct sock *)arg0;
+	if ($sk->__sk_common.skc_num == $2) {
+		@packets_queued = count();
+		if (@oldest == 0) {
+			@oldest = nsecs;
+		}
+	}
+}
+
+/* Receive thread got packets. */
+tracepoint:syscalls:sys_exit_recvmmsg /pid == $1 && args->ret > 0/
+{
+	@mine[tid] = 1;
+	if (@oldest) {
+		$d = nsecs - @oldest;
+		@s1_socket_wait = hist($d);
+		@s1_socket_wait_stats = stats($d);
+		@oldest = 0;
+	}
+	if (@wake[tid]) {
+		$d = nsecs - @wake[tid];
+		@s2_receiver_wakeup = hist($d);
+		@s2_receiver_wakeup_stats = stats($d);
+		delete(@wake[tid]);
+	}
+	@recv_done[tid] = nsecs;
+	@packets_per_recvmmsg = hist(args->ret);
+}
+
+/* Any of our threads is being woken (by anyone: softirq, another thread). */
+tracepoint:sched:sched_waking /@mine[args->pid]/
+{
+	@wake[args->pid] = nsecs;
+	@runq[args->pid] = nsecs;
+}
+
+/* Wakeups issued by our own threads: the hand-offs between stages. */
+tracepoint:sched:sched_waking /pid == $1/
+{
+	if (strncmp(comm, "ssListen", 8) == 0 && strncmp(args->comm, "ssPxyTx", 7) == 0) {
+		if (@recv_done[tid]) {
+			$d = nsecs - @recv_done[tid];
+			@s3_receive_to_coordinator_wake = hist($d);
+			@s3_receive_to_coordinator_wake_stats = stats($d);
+			delete(@recv_done[tid]);
+		}
+	} else if (strncmp(comm, "ssPxyTx", 7) == 0 && strncmp(args->comm, "ssPxyDst", 8) == 0) {
+		if (@tx_run[tid]) {
+			$d = nsecs - @tx_run[tid];
+			@s5_coordinator_to_each_worker_wake = hist($d);
+			@s5_coordinator_to_each_worker_wake_stats = stats($d);
+			@tx_last[tid] = nsecs;
+			@tx_wakes[tid] = @tx_wakes[tid] + 1;
+		}
+	}
+}
+
+/* Woken thread is back in userspace (crossbeam channels park on futex). */
+tracepoint:syscalls:sys_exit_futex /pid == $1/
+{
+	@mine[tid] = 1;
+	if (@wake[tid]) {
+		$d = nsecs - @wake[tid];
+		delete(@wake[tid]);
+		if (strncmp(comm, "ssPxyDst", 8) == 0) {
+			@s6_worker_wakeup = hist($d);
+			@s6_worker_wakeup_stats = stats($d);
+			@w_run[tid] = nsecs;
+		} else if (strncmp(comm, "ssPxyTx", 7) == 0) {
+			@s4_coordinator_wakeup = hist($d);
+			@s4_coordinator_wakeup_stats = stats($d);
+			@tx_run[tid] = nsecs;
+			@tx_wakes[tid] = 0;
+		}
+	}
+}
+
+/* Coordinator goes back to sleep: how long it took to wake every worker. */
+tracepoint:syscalls:sys_enter_futex /pid == $1 && @tx_run[tid]/
+{
+	$op = args->op & 127;
+	if ($op == 0 || $op == 9) {
+		if (@tx_last[tid]) {
+			$d = @tx_last[tid] - @tx_run[tid];
+			@s5b_coordinator_wake_to_last_worker_wake = hist($d);
+			@s5b_coordinator_wake_to_last_worker_wake_stats = stats($d);
+			@workers_woken_per_coordinator_wakeup = hist(@tx_wakes[tid]);
+		}
+		delete(@tx_run[tid]);
+		delete(@tx_last[tid]);
+	}
+}
+
+/* Worker sends. */
+tracepoint:syscalls:sys_enter_sendmmsg /pid == $1/
+{
+	@mine[tid] = 1;
+	@send_start[tid] = nsecs;
+	if (@w_run[tid]) {
+		$d = nsecs - @w_run[tid];
+		@s7_worker_wake_to_send = hist($d);
+		@s7_worker_wake_to_send_stats = stats($d);
+		delete(@w_run[tid]);
+	}
+}
+
+tracepoint:syscalls:sys_exit_sendmmsg /pid == $1 && @send_start[tid]/
+{
+	$d = nsecs - @send_start[tid];
+	@s8_sendmmsg = hist($d);
+	@s8_sendmmsg_stats = stats($d);
+	@packets_per_sendmmsg = hist(args->ret);
+	delete(@send_start[tid]);
+}
+
+/* Run-queue delay: woken until actually put on a CPU (scheduler contention). */
+tracepoint:sched:sched_switch /@runq[args->next_pid]/
+{
+	$d = nsecs - @runq[args->next_pid];
+	delete(@runq[args->next_pid]);
+	if (strncmp(args->next_comm, "ssListen", 8) == 0) {
+		@runq_receiver = hist($d);
+		@runq_receiver_stats = stats($d);
+	} else if (strncmp(args->next_comm, "ssPxyTx", 7) == 0) {
+		@runq_coordinator = hist($d);
+		@runq_coordinator_stats = stats($d);
+	} else if (strncmp(args->next_comm, "ssPxyDst", 8) == 0) {
+		@runq_worker = hist($d);
+		@runq_worker_stats = stats($d);
+	}
+}
+
+interval:s:1
+{
+	@elapsed = @elapsed + 1;
+	if (@elapsed >= $3) {
+		exit();
+	}
+}
+
+END
+{
+	clear(@mine); clear(@wake); clear(@runq); clear(@recv_done); clear(@tx_run);
+	clear(@tx_last); clear(@tx_wakes); clear(@w_run); clear(@send_start);
+	clear(@oldest); clear(@elapsed);
+
+	printf("\n===== SUMMARY (count, average ns) =====\n");
+	print(@packets_queued);
+	print(@s1_socket_wait_stats);
+	print(@s2_receiver_wakeup_stats);
+	print(@s3_receive_to_coordinator_wake_stats);
+	print(@s4_coordinator_wakeup_stats);
+	print(@s5_coordinator_to_each_worker_wake_stats);
+	print(@s5b_coordinator_wake_to_last_worker_wake_stats);
+	print(@s6_worker_wakeup_stats);
+	print(@s7_worker_wake_to_send_stats);
+	print(@s8_sendmmsg_stats);
+	print(@runq_receiver_stats);
+	print(@runq_coordinator_stats);
+	print(@runq_worker_stats);
+
+	printf("\n===== HISTOGRAMS (ns) =====\n");
+	printf("\nS1 oldest queued packet -> receive thread has it\n");
+	print(@s1_socket_wait);
+	printf("\nS2 receive thread woken -> back in userspace\n");
+	print(@s2_receiver_wakeup);
+	printf("\nS3 receive done -> coordinator woken\n");
+	print(@s3_receive_to_coordinator_wake);
+	printf("\nS4 coordinator woken -> back in userspace\n");
+	print(@s4_coordinator_wakeup);
+	printf("\nS5 coordinator running -> each worker woken\n");
+	print(@s5_coordinator_to_each_worker_wake);
+	printf("\nS5b coordinator running -> last worker woken\n");
+	print(@s5b_coordinator_wake_to_last_worker_wake);
+	print(@workers_woken_per_coordinator_wakeup);
+	printf("\nS6 worker woken -> back in userspace\n");
+	print(@s6_worker_wakeup);
+	printf("\nS7 worker back in userspace -> sendmmsg starts\n");
+	print(@s7_worker_wake_to_send);
+	printf("\nS8 sendmmsg duration\n");
+	print(@s8_sendmmsg);
+	print(@packets_per_recvmmsg);
+	print(@packets_per_sendmmsg);
+	printf("\nRun-queue delay (woken -> on CPU)\n");
+	print(@runq_receiver);
+	print(@runq_coordinator);
+	print(@runq_worker);
+
+	clear(@packets_queued);
+	clear(@s1_socket_wait); clear(@s1_socket_wait_stats);
+	clear(@s2_receiver_wakeup); clear(@s2_receiver_wakeup_stats);
+	clear(@s3_receive_to_coordinator_wake); clear(@s3_receive_to_coordinator_wake_stats);
+	clear(@s4_coordinator_wakeup); clear(@s4_coordinator_wakeup_stats);
+	clear(@s5_coordinator_to_each_worker_wake); clear(@s5_coordinator_to_each_worker_wake_stats);
+	clear(@s5b_coordinator_wake_to_last_worker_wake); clear(@s5b_coordinator_wake_to_last_worker_wake_stats);
+	clear(@workers_woken_per_coordinator_wakeup);
+	clear(@s6_worker_wakeup); clear(@s6_worker_wakeup_stats);
+	clear(@s7_worker_wake_to_send); clear(@s7_worker_wake_to_send_stats);
+	clear(@s8_sendmmsg); clear(@s8_sendmmsg_stats);
+	clear(@packets_per_recvmmsg); clear(@packets_per_sendmmsg);
+	clear(@runq_receiver); clear(@runq_receiver_stats);
+	clear(@runq_coordinator); clear(@runq_coordinator_stats);
+	clear(@runq_worker); clear(@runq_worker_stats);
+}

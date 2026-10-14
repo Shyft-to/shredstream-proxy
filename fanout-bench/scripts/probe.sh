@@ -8,7 +8,8 @@
 #
 # Settings (environment):
 #   IN_IF    interface that carries ingress and network egress  (bond0)
-#   OUT      results directory                                   (./bench-results)
+#   OUT      results directory: prod-results.jsonl (one JSON line   (./bench-results)
+#            per run) and LABEL-TIMESTAMP.txt (printed report) 
 #   CAP_DIR  where captures are written (RAM by default)         (/dev/shm)
 #   KEEP_PCAP=1  keep the capture
 set -euo pipefail
@@ -84,7 +85,8 @@ measure() {
         --dests "$dests" --egress-src-ports "$src_ports" --label "$label" \
         --results "$OUT/prod-results.jsonl" --cpu-ms "$((c1 - c0))" \
         --meta "source=production" --meta "pid=$pid" --meta "tcpdump_dropped=$dropped" \
-        --meta "kernel_udp_errors=${drops:-none}"
+        --meta "kernel_udp_errors=${drops:-none}" |
+        tee "$OUT/$label-$stamp.txt"
 
     if [ "${KEEP_PCAP:-0}" = "1" ]; then
         echo "captures kept: $net_pcap $lo_pcap"
@@ -105,5 +107,5 @@ corpus() {
 case "${1:-}" in
     measure) shift; measure "$@" ;;
     corpus) shift; corpus "$@" ;;
-    *) sed -n '2,13p' "$0"; exit 1 ;;
+    *) sed -n '2,14p' "$0"; exit 1 ;;
 esac
