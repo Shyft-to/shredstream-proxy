@@ -1,5 +1,5 @@
 [workspace]
-members = ["examples", "jito_protos", "proxy"]
+members = ["examples", "fanout-bench", "jito_protos", "proxy"]
 resolver = "2"
 
 [workspace.package]

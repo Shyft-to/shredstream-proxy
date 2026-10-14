@@ -1,0 +1,25 @@
+[package]
+name = "fanout-bench"
+version = { workspace = true }
+description = "North-star latency measurement and test bed for UDP shred fan-out"
+authors = { workspace = true }
+homepage = { workspace = true }
+edition = { workspace = true }
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "fanout-measure"
+path = "src/bin/fanout_measure.rs"
+
+[[bin]]
+name = "shred-replay"
+path = "src/bin/shred_replay.rs"
+
+[[bin]]
+name = "udp-sink"
+path = "src/bin/udp_sink.rs"
