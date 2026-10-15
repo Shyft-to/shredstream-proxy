@@ -63,6 +63,7 @@ network device. Reported at p99 over all shreds in the window.
 | `scripts/probe.sh` | Production: passive north-star measurement of a live instance, and corpus capture. |
 | `scripts/probe.sh box PORTS` | Box-level north star across several forwarders: first arrival on any port → first copy leaving the box for each destination. |
 | `scripts/toggle.sh` | A/B test of the kernel dedup filter (`fanout/scripts/dedup.sh`) on live traffic: switches the filter off/on between runs; forwarders keep running. |
+| `scripts/fleet.sh` | A/B test of two binaries across all forwarders at once (box level), with the kernel dedup filter held on or off (`DEDUP=on|off`); restores the services at the end. |
 | `scripts/ab.sh` | A/B test of two binaries on live production traffic: takes over one instance's port, alternates the two, restores the systemd service at the end. |
 | `scripts/profile.sh` | Profiling a live instance: per-stage latency histograms (`stages`, via `stages.bt`) and CPU by function (`cpu`, via `perf`). |
 
