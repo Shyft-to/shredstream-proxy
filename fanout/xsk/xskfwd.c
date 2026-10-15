@@ -14,6 +14,7 @@
  *
  * Usage: xskfwd --rx IF[,IF] --queue Q --dests FILE [--pin DIR] [--cpu N]
  *               [--copy] [--report SECS] [--label L] [--results FILE]
+ *               [--local-cpu N]   (local sends on their own thread on cpu N)
  *
  * DESTS file, one destination per line (written by fanout/scripts/xsk.sh):
  *   IFNAME DST_MAC SRC_MAC SRC_IP DST_IP DST_PORT VLAN
@@ -26,13 +27,16 @@
 #include <linux/if_link.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -49,12 +53,64 @@
 #define MAX_DESTS 32
 #define QUEUES_PER_SLOT 64
 #define META_MAGIC 0x78736b6d65746131ULL
-#define MAX_SAMPLES (4u << 20)
+#define LOCAL_RING 1024          /* shreds queued for the local-send thread */
+#define LOCAL_MAX 2036           /* largest payload it takes */
+#define STALL_NS 20000           /* an idle loop pass longer than this was interrupted */
 
 struct meta {
 	uint64_t magic;
 	uint64_t rx_ns;
 };
+
+/*
+ * Latency histogram: 250 ns buckets up to 4.096 ms, then 1 ms buckets up to
+ * 68 ms. Adding a sample and reading percentiles are cheap enough for the
+ * busy-polling thread (sorting samples there stalled it for milliseconds).
+ */
+#define H_FINE 16384
+#define H_FINE_NS 250
+#define H_N (H_FINE + 64)
+
+struct hist {
+	uint32_t b[H_N];
+	uint64_t n, sum, max;
+};
+
+static void h_add(struct hist *h, uint64_t ns)
+{
+	uint64_t i = ns / H_FINE_NS;
+
+	if (i >= H_FINE) {
+		i = H_FINE + (ns - (uint64_t)H_FINE * H_FINE_NS) / 1000000;
+		if (i >= H_N)
+			i = H_N - 1;
+	}
+	h->b[i]++;
+	h->n++;
+	h->sum += ns;
+	if (ns > h->max)
+		h->max = ns;
+}
+
+/* Percentile in microseconds (bucket middle, never above the maximum). */
+static double h_pct(const struct hist *h, double p)
+{
+	uint64_t rank = (uint64_t)(p * h->n + 0.999999), acc = 0, v = h->max;
+
+	if (!h->n)
+		return 0;
+	if (rank < 1)
+		rank = 1;
+	for (uint32_t i = 0; i < H_N; i++) {
+		acc += h->b[i];
+		if (acc >= rank) {
+			v = i < H_FINE ? (uint64_t)i * H_FINE_NS + H_FINE_NS / 2
+				       : (uint64_t)H_FINE * H_FINE_NS + (uint64_t)(i - H_FINE) * 1000000 + 500000;
+			break;
+		}
+	}
+	return (v < h->max ? v : h->max) / 1000.0;
+}
 
 struct port {
 	char name[IF_NAMESIZE];
@@ -88,13 +144,43 @@ static struct dest dests[MAX_DESTS];
 static int ndests;
 static volatile sig_atomic_t running = 1;
 static int local_fd = -1;
+static int nlocal;
 
 static struct {
 	uint64_t shreds, copies, tx_full, local_fail, no_meta;
 	uint64_t busy_ns;        /* time spent handling shreds (capacity use) */
-	uint32_t n;
-	uint64_t *first, *last;
+	uint64_t nic_ns, local_ns; /* of which: NIC copies, local sends (inline) */
+	uint64_t kicks;          /* send-ring wake-up system calls */
+	uint64_t max_batch, stalls, max_stall_ns;
+	struct hist wait;        /* arrival -> handling starts (queueing before us) */
+	struct hist first, last; /* arrival -> first / last copy handed over */
 } st;
+
+/*
+ * Optional local-send thread (--local-cpu): the main thread only copies the
+ * payload into this ring; the thread does the UDP sends (a loopback send runs
+ * the receiver's network stack inline, which is the costly part).
+ */
+struct lslot {
+	uint64_t rx_ns;
+	uint32_t len;
+	uint8_t data[LOCAL_MAX];
+} __attribute__((aligned(64)));
+
+struct lstats {
+	uint64_t sent, fail, invol;
+	struct hist lat;         /* arrival -> local copies sent */
+};
+
+static struct {
+	struct lslot *slot;
+	_Alignas(64) _Atomic uint32_t head; /* written by the main thread */
+	_Alignas(64) _Atomic uint32_t tail; /* written by the local thread */
+	_Alignas(64) _Atomic int snap;      /* 1 = main asks for stats, 2 = ready */
+	struct lstats cur, out;
+	int on;
+	uint64_t dropped;        /* ring full (main thread) */
+} lq;
 
 static void die(const char *what)
 {
@@ -290,8 +376,82 @@ static void setup_port(struct port *p, uint32_t queue, int copy, int socks_fd, i
 
 static void kick_tx(struct port *p)
 {
-	if (xsk_ring_prod__needs_wakeup(&p->tx))
+	if (xsk_ring_prod__needs_wakeup(&p->tx)) {
 		sendto(xsk_socket__fd(p->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+		st.kicks++;
+	}
+}
+
+/* Involuntary context switches of the calling thread (it was preempted). */
+static uint64_t invol_switches(void)
+{
+	struct rusage ru;
+
+	return getrusage(RUSAGE_THREAD, &ru) ? 0 : (uint64_t)ru.ru_nivcsw;
+}
+
+static void send_local(const uint8_t *payload, uint32_t plen, uint64_t *sent, uint64_t *fail)
+{
+	for (int i = 0; i < ndests; i++) {
+		if (!dests[i].local)
+			continue;
+		if (sendto(local_fd, payload, plen, MSG_DONTWAIT, (struct sockaddr *)&dests[i].addr,
+			   sizeof(dests[i].addr)) < 0)
+			(*fail)++;
+		else
+			(*sent)++;
+	}
+}
+
+static void *local_thread(void *arg)
+{
+	int cpu = (int)(long)arg;
+	cpu_set_t set;
+	uint32_t tail = 0;
+	uint64_t invol0 = invol_switches();
+
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set))
+		fprintf(stderr, "xskfwd: could not pin the local-send thread to cpu %d\n", cpu);
+	while (running) {
+		uint32_t head = atomic_load_explicit(&lq.head, memory_order_acquire);
+
+		while (tail != head) {
+			struct lslot *s = &lq.slot[tail % LOCAL_RING];
+
+			send_local(s->data, s->len, &lq.cur.sent, &lq.cur.fail);
+			if (s->rx_ns)
+				h_add(&lq.cur.lat, now_ns() - s->rx_ns);
+			tail++;
+			atomic_store_explicit(&lq.tail, tail, memory_order_release);
+		}
+		if (atomic_load_explicit(&lq.snap, memory_order_acquire) == 1) {
+			uint64_t invol = invol_switches();
+
+			lq.cur.invol = invol - invol0;
+			invol0 = invol;
+			lq.out = lq.cur;
+			memset(&lq.cur, 0, sizeof(lq.cur));
+			atomic_store_explicit(&lq.snap, 2, memory_order_release);
+		}
+	}
+	return NULL;
+}
+
+/* Hands one shred to the local-send thread; 0 if queued. */
+static int queue_local(const uint8_t *payload, uint32_t plen, uint64_t rx_ns)
+{
+	uint32_t head = atomic_load_explicit(&lq.head, memory_order_relaxed);
+
+	if (plen > LOCAL_MAX || head - atomic_load_explicit(&lq.tail, memory_order_acquire) >= LOCAL_RING)
+		return -1;
+	struct lslot *s = &lq.slot[head % LOCAL_RING];
+	s->rx_ns = rx_ns;
+	s->len = plen;
+	memcpy(s->data, payload, plen);
+	atomic_store_explicit(&lq.head, head + 1, memory_order_release);
+	return 0;
 }
 
 static void reclaim(struct port *p)
@@ -396,108 +556,126 @@ static void handle(uint8_t *pkt, uint32_t len)
 			ports[p].tx_pending = 0;
 			kick_tx(&ports[p]);
 		}
-	t = now_ns();
-	for (int i = 0; i < ndests; i++) {
-		if (!dests[i].local)
-			continue;
-		if (sendto(local_fd, payload, plen, MSG_DONTWAIT, (struct sockaddr *)&dests[i].addr,
-			   sizeof(dests[i].addr)) < 0)
-			st.local_fail++;
-		else
-			st.copies++;
+	uint64_t t_nic = now_ns();
+	t = t_nic;
+	if (nlocal) {
+		if (lq.on) {
+			if (queue_local(payload, plen, rx_ns))
+				lq.dropped++;
+		} else {
+			send_local(payload, plen, &st.copies, &st.local_fail);
+		}
 		t = now_ns();
 	}
 	st.shreds++;
 	st.busy_ns += t - t_begin;
-	if (rx_ns && st.n < MAX_SAMPLES) {
-		st.first[st.n] = (sent_any ? t_first : t) - rx_ns;
-		st.last[st.n] = t - rx_ns;
-		st.n++;
+	st.nic_ns += t_nic - t_begin;
+	st.local_ns += t - t_nic;
+	if (rx_ns) {
+		h_add(&st.wait, t_begin - rx_ns);
+		h_add(&st.first, (sent_any ? t_first : t) - rx_ns);
+		/* With the local thread, "all copies" means all NIC copies. */
+		h_add(&st.last, (lq.on ? t_nic : t) - rx_ns);
 	}
 }
 
-static int cmp_u64(const void *a, const void *b)
+static void summary_json(FILE *f, const struct hist *h)
 {
-	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-
-	return x < y ? -1 : x > y;
-}
-
-static double pct(uint64_t *v, uint32_t n, double p)
-{
-	uint32_t rank = (uint32_t)(p * n + 0.999999);
-
-	if (rank < 1)
-		rank = 1;
-	if (rank > n)
-		rank = n;
-	return v[rank - 1] / 1000.0;
-}
-
-static void summary_json(FILE *f, uint64_t *v, uint32_t n)
-{
-	double sum = 0;
-
-	for (uint32_t i = 0; i < n; i++)
-		sum += v[i];
 	fprintf(f,
-		"{\"count\":%u,\"mean_us\":%.1f,\"p50_us\":%.1f,\"p90_us\":%.1f,\"p99_us\":%.1f,"
+		"{\"count\":%lu,\"mean_us\":%.1f,\"p50_us\":%.1f,\"p90_us\":%.1f,\"p99_us\":%.1f,"
 		"\"p999_us\":%.1f,\"max_us\":%.1f}",
-		n, n ? sum / n / 1000.0 : 0, pct(v, n, .5), pct(v, n, .9), pct(v, n, .99), pct(v, n, .999),
-		n ? v[n - 1] / 1000.0 : 0);
+		(unsigned long)h->n, h->n ? h->sum / 1000.0 / h->n : 0, h_pct(h, .5), h_pct(h, .9), h_pct(h, .99),
+		h_pct(h, .999), h->max / 1000.0);
 }
 
-static void report(double secs, const char *label, const char *results)
+/* Takes the local-send thread's stats for this window (it hands them over). */
+static void local_snapshot(void)
 {
-	uint32_t n = st.n;
+	uint64_t until = now_ns() + 50000000ull;
 
-	if (n) {
-		qsort(st.first, n, sizeof(uint64_t), cmp_u64);
-		qsort(st.last, n, sizeof(uint64_t), cmp_u64);
+	if (!lq.on)
+		return;
+	atomic_store_explicit(&lq.snap, 1, memory_order_release);
+	while (atomic_load_explicit(&lq.snap, memory_order_acquire) != 2 && now_ns() < until)
+		;
+	if (atomic_load_explicit(&lq.snap, memory_order_acquire) != 2)
+		memset(&lq.out, 0, sizeof(lq.out));
+	atomic_store_explicit(&lq.snap, 0, memory_order_release);
+}
+
+static void report(double secs, const char *label, const char *results, uint64_t invol)
+{
+	double per = st.shreds ? 1000.0 * st.shreds : 1;
+
+	local_snapshot();
+	if (st.last.n) {
 		printf("[%s] %.0fs: %lu shreds, %lu copies, send ring full %lu, local send failed %lu, "
 		       "busy %.1f%% (%.2f us/shred) | "
 		       "all copies: p50 %.1f p90 %.1f p99 %.1f p99.9 %.1f max %.1f us | "
 		       "first copy: p50 %.1f p99 %.1f us\n",
-		       label, secs, (unsigned long)st.shreds, (unsigned long)st.copies, (unsigned long)st.tx_full,
-		       (unsigned long)st.local_fail, st.busy_ns / (secs * 1e7),
-		       st.shreds ? st.busy_ns / 1000.0 / st.shreds : 0, pct(st.last, n, .5), pct(st.last, n, .9),
-		       pct(st.last, n, .99),
-		       pct(st.last, n, .999), st.last[n - 1] / 1000.0, pct(st.first, n, .5), pct(st.first, n, .99));
+		       label, secs, (unsigned long)st.shreds, (unsigned long)(st.copies + lq.out.sent),
+		       (unsigned long)st.tx_full, (unsigned long)(st.local_fail + lq.out.fail + lq.dropped),
+		       st.busy_ns / (secs * 1e7), st.busy_ns / per, h_pct(&st.last, .5), h_pct(&st.last, .9),
+		       h_pct(&st.last, .99), h_pct(&st.last, .999), st.last.max / 1000.0, h_pct(&st.first, .5),
+		       h_pct(&st.first, .99));
+		/* Where the time goes: waiting before we start on a shred, versus our work. */
+		printf("   wait before handling: p50 %.1f p99 %.1f p99.9 %.1f max %.1f us | per shred: NIC copies "
+		       "%.2f us, local %.2f us, %.2f kicks | max batch %lu | stalls >%dus %lu (max %.0f us), "
+		       "preempted %lu",
+		       h_pct(&st.wait, .5), h_pct(&st.wait, .99), h_pct(&st.wait, .999), st.wait.max / 1000.0,
+		       st.nic_ns / per, st.local_ns / per, st.kicks / (per / 1000.0), (unsigned long)st.max_batch,
+		       STALL_NS / 1000, (unsigned long)st.stalls, st.max_stall_ns / 1000.0, (unsigned long)invol);
+		if (lq.on)
+			printf(" | local thread: p50 %.1f p99 %.1f p99.9 %.1f max %.1f us, preempted %lu",
+			       h_pct(&lq.out.lat, .5), h_pct(&lq.out.lat, .99), h_pct(&lq.out.lat, .999),
+			       lq.out.lat.max / 1000.0, (unsigned long)lq.out.invol);
+		printf("\n");
 	} else {
 		printf("[%s] %.0fs: %lu shreds, no timed samples (no arrival metadata: %lu)\n", label, secs,
 		       (unsigned long)st.shreds, (unsigned long)st.no_meta);
 	}
 	fflush(stdout);
-	if (results && n) {
+	if (results && st.last.n) {
 		FILE *f = fopen(results, "a");
 
 		if (f) {
 			fprintf(f, "{\"label\":\"%s\",\"unix_time\":%ld,\"source\":\"xskfwd\",\"meta\":{},"
 				   "\"capture_seconds\":%.1f,\"eligible_shreds\":%lu,\"delivery_pct\":100,"
-				   "\"duplicate_sends\":0,\"send_ring_full\":%lu,\"completion\":",
-				label, (long)time(NULL), secs, (unsigned long)st.shreds, (unsigned long)st.tx_full);
-			summary_json(f, st.last, n);
+				   "\"duplicate_sends\":0,\"send_ring_full\":%lu,\"busy_us_per_shred\":%.2f,"
+				   "\"nic_us_per_shred\":%.2f,\"local_us_per_shred\":%.2f,\"stalls\":%lu,"
+				   "\"preempted\":%lu,\"local_thread\":%d,\"completion\":",
+				label, (long)time(NULL), secs, (unsigned long)st.shreds, (unsigned long)st.tx_full,
+				st.busy_ns / per, st.nic_ns / per, st.local_ns / per, (unsigned long)st.stalls,
+				(unsigned long)invol, lq.on);
+			summary_json(f, &st.last);
 			fprintf(f, ",\"first_dest\":");
-			summary_json(f, st.first, n);
+			summary_json(f, &st.first);
+			fprintf(f, ",\"wait\":");
+			summary_json(f, &st.wait);
+			if (lq.on) {
+				fprintf(f, ",\"local\":");
+				summary_json(f, &lq.out.lat);
+			}
 			fprintf(f, "}\n");
 			fclose(f);
 		}
 	}
-	st.shreds = st.copies = st.tx_full = st.local_fail = st.no_meta = st.busy_ns = 0;
-	st.n = 0;
+	memset(&st, 0, sizeof(st));
+	lq.dropped = 0;
 }
 
 int main(int argc, char **argv)
 {
 	const char *rx_list = NULL, *dests_path = NULL, *pin = "/sys/fs/bpf/xskfwd", *label = "xskfwd";
 	const char *results = NULL;
-	int queue = -1, cpu = -1, copy = 0, report_s = 10;
+	int queue = -1, cpu = -1, copy = 0, report_s = 10, local_cpu = -1;
 	static const struct option opts[] = {
 		{"rx", required_argument, 0, 'r'},     {"queue", required_argument, 0, 'q'},
 		{"dests", required_argument, 0, 'd'},  {"pin", required_argument, 0, 'p'},
 		{"cpu", required_argument, 0, 'c'},    {"copy", no_argument, 0, 'C'},
 		{"report", required_argument, 0, 'R'}, {"label", required_argument, 0, 'l'},
-		{"results", required_argument, 0, 'o'}, {0, 0, 0, 0},
+		{"results", required_argument, 0, 'o'}, {"local-cpu", required_argument, 0, 'L'},
+		{0, 0, 0, 0},
 	};
 	int o;
 
@@ -512,6 +690,7 @@ int main(int argc, char **argv)
 		case 'R': report_s = atoi(optarg); break;
 		case 'l': label = optarg; break;
 		case 'o': results = optarg; break;
+		case 'L': local_cpu = atoi(optarg); break;
 		default: goto usage;
 		}
 	}
@@ -532,13 +711,11 @@ int main(int argc, char **argv)
 	if (socks_fd < 0 || slots_fd < 0)
 		die("open pinned maps (is the XDP program loaded? xsk.sh setup)");
 
-	st.first = calloc(MAX_SAMPLES, sizeof(uint64_t));
-	st.last = calloc(MAX_SAMPLES, sizeof(uint64_t));
-	if (!st.first || !st.last)
-		die("allocate samples");
 	local_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (local_fd < 0)
 		die("local UDP socket");
+	for (int i = 0; i < ndests; i++)
+		nlocal += dests[i].local;
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
@@ -554,9 +731,24 @@ int main(int argc, char **argv)
 			die("pin to cpu");
 	}
 	fprintf(stderr, "xskfwd: %d destinations, %d interfaces, busy-polling on cpu %d\n", ndests, nports, cpu);
+	pthread_t lt;
+	if (nlocal && local_cpu >= 0) {
+		lq.slot = aligned_alloc(64, sizeof(struct lslot) * LOCAL_RING);
+		if (!lq.slot)
+			die("allocate local ring");
+		lq.on = 1;
+		if (pthread_create(&lt, NULL, local_thread, (void *)(long)local_cpu)) {
+			errno = EAGAIN;
+			die("start the local-send thread");
+		}
+		fprintf(stderr, "xskfwd: %d local destination(s) sent by a thread on cpu %d\n", nlocal, local_cpu);
+	}
 
 	uint64_t next_report = now_ns() + (uint64_t)report_s * 1000000000ull, start = now_ns();
+	uint64_t invol0 = invol_switches();
 	while (running) {
+		uint64_t t_pass = now_ns(), got = 0;
+
 		for (int p = 0; p < nports; p++) {
 			struct port *pp = &ports[p];
 			uint32_t idx, fidx, n;
@@ -569,6 +761,9 @@ int main(int argc, char **argv)
 					recvfrom(xsk_socket__fd(pp->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 				continue;
 			}
+			got += n;
+			if (n > st.max_batch)
+				st.max_batch = n;
 			for (uint32_t i = 0; i < n; i++) {
 				const struct xdp_desc *d = xsk_ring_cons__rx_desc(&pp->rx, idx + i);
 				handle(xsk_umem__get_data(pp->area, d->addr), d->len);
@@ -586,12 +781,25 @@ int main(int argc, char **argv)
 		for (int p = 0; p < nports; p++)
 			reclaim(&ports[p]);
 		uint64_t t = now_ns();
+		/* A pass with nothing to do takes well under a microsecond; a long
+		 * one means this thread was interrupted or preempted. */
+		if (!got && t - t_pass > STALL_NS) {
+			st.stalls++;
+			if (t - t_pass > st.max_stall_ns)
+				st.max_stall_ns = t - t_pass;
+		}
 		if (t >= next_report) {
-			report((t - start) / 1e9, label, results);
+			uint64_t invol = invol_switches();
+
+			report((t - start) / 1e9, label, results, invol - invol0);
+			invol0 = invol;
+			t = now_ns();
 			start = t;
 			next_report = t + (uint64_t)report_s * 1000000000ull;
 		}
 	}
+	if (lq.on)
+		pthread_join(lt, NULL);
 
 	/* Stop receiving first, so the XDP program passes shreds up the stack
 	 * (to the regular forwarders) before the sockets go away. */
@@ -607,7 +815,7 @@ int main(int argc, char **argv)
 
 usage:
 	fprintf(stderr, "usage: %s --rx IF[,IF] --queue Q --dests FILE [--pin DIR] [--cpu N] [--copy]\n"
-			"       [--report SECS] [--label L] [--results FILE]\n",
+			"       [--report SECS] [--label L] [--results FILE] [--local-cpu N]\n",
 		argv[0]);
 	return 2;
 }

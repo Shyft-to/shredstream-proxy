@@ -20,7 +20,9 @@
 #   QUEUE (47)         dedicated queue on each interface
 #   IRQ_CPUS (29,30)   CPU for each interface's QUEUE interrupt, in interface order
 #   FWD_CPU (28)       CPU the forwarder busy-polls on
-#   MODE (zc)          zc = zero-copy; copy = copy mode (e.g. virtual devices in the lab)
+#   LOCAL_CPU (unset)  if set, local (127.x) destinations are sent by a second
+#                      busy-polling thread on this CPU instead of inline
+#   MODE (zc)         zc = zero-copy; copy = copy mode (e.g. virtual devices in the lab)
 #   STEER (1)          0 = no flow rules (devices without ntuple support)
 #   PIN (/sys/fs/bpf/xskfwd)  where the shared maps are pinned; its parent must be
 #                      a bpf filesystem. Inside network namespaces (the lab) use one
@@ -42,6 +44,7 @@ DEV=${DEV:-bond0}
 QUEUE=${QUEUE:-47}
 IRQ_CPUS=${IRQ_CPUS:-29,30}
 FWD_CPU=${FWD_CPU:-28}
+LOCAL_CPU=${LOCAL_CPU:-}
 MODE=${MODE:-zc}
 STEER=${STEER:-1}
 OUT=${OUT:-./bench-results}
@@ -65,7 +68,7 @@ build() {
     mkdir -p "$BUILD"
     clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
         "${defs[@]}" -c "$XSK_DIR/xsk_kern.bpf.c" -o "$OBJ"
-    gcc -O2 -g -Wall -o "$FWD" "$XSK_DIR/xskfwd.c" -lxdp -lbpf -lelf -lz
+    gcc -O2 -g -Wall -pthread -o "$FWD" "$XSK_DIR/xskfwd.c" -lxdp -lbpf -lelf -lz
     echo "built $OBJ (ports $ports) and $FWD"
 }
 
@@ -217,7 +220,8 @@ run() {
     local rx
     rx=$(ifaces | paste -sd,)
     exec "$FWD" --rx "$rx" --queue "$QUEUE" --dests "$file" --pin "$PIN" --cpu "$FWD_CPU" \
-        $(if [ "$MODE" = copy ]; then echo --copy; fi) --label "$label" \
+        $(if [ "$MODE" = copy ]; then echo --copy; fi) \
+        $(if [ -n "$LOCAL_CPU" ]; then echo --local-cpu "$LOCAL_CPU"; fi) --label "$label" \
         --results "$OUT/xsk-results.jsonl"
 }
 
