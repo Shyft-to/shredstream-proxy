@@ -28,12 +28,13 @@ MEASURE_S=${MEASURE_S:-10}
 PORTS=$1 DESTS=$2 PAIRS=$3
 
 run_id=$(date +%Y%m%d-%H%M)
+direct_suffix() { if [ "$1" = 1 ]; then echo -direct; fi; }
 if [ "${A_KFAN:-0}" = "1" ]; then
-    a_label="kfan${A_DROP:+-drop$A_DROP}$([ "${A_DIRECT:-0}" = 1 ] && echo -direct)@$run_id"
+    a_label="kfan${A_DROP:+-drop$A_DROP}$(direct_suffix "${A_DIRECT:-0}")@$run_id"
 else
     a_label="dedup@$run_id"
 fi
-b_label="kfan${B_DROP:+-drop$B_DROP}$([ "${B_DIRECT:-0}" = 1 ] && echo -direct)@$run_id"
+b_label="kfan${B_DROP:+-drop$B_DROP}$(direct_suffix "${B_DIRECT:-0}")@$run_id"
 [ "$a_label" != "$b_label" ] || { echo "A and B are the same setup" >&2; exit 1; }
 
 finish() {

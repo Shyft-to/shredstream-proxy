@@ -126,7 +126,7 @@ load_dests() {
     done
     bpftool map update name kfan_dests key hex $(hex_le32 ${#entries[@]}) value hex $(printf '00 %.0s' $(seq 28))
     bpftool map update name kfan_dests key hex $(hex_le32 0) value hex ${entries[0]}
-    echo "loaded ${#entries[@]} destinations$([ "$DIRECT" = 1 ] && echo " (direct to NIC ports)")"
+    echo "loaded ${#entries[@]} destinations$(if [ "$DIRECT" = 1 ]; then echo " (direct to NIC ports)"; fi)"
 }
 
 # Reloads the table whenever the set of active bond ports changes, and
