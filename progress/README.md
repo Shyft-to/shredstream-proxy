@@ -1,14 +1,11 @@
-# Fan-out latency R&D — progress log
+# Progress
 
-Goal: forward UDP shreds received on one port to 5–20 destinations as fast as
-possible, measured by the north-star metric defined in Chapter 1.
+- **[STATUS.md](STATUS.md)** — start here. One page, always current: goal,
+  current baseline, key findings, what is ruled out, open questions, next
+  steps.
+- **Chapters** — one per working day (`chapter-NN-YYYY-MM-DD.md`), a few
+  short entries each: what we tried, the result, the decision.
 
-Each chapter briefly records where we stood on a given date: what we changed,
-what we measured, and what we decided next. Anything not established beyond
-doubt is tagged **[Hypothesis]**. Chapters are not rewritten after the fact;
-corrections go into a later chapter.
-
-| Chapter | Date | Topic |
-|---|---|---|
-| [Chapter 1](chapter-01-2026-10-14-baseline.md) | 2026-10-14 | Server survey, quick fixes, north-star metric, first production baseline |
-| [Chapter 2](chapter-02-2026-10-14-profiling.md) | 2026-10-14 | Stage-by-stage profile of the proxy; ranked bottlenecks |
+Rules: conclusions first; only numbers that support a finding or decision;
+raw outputs stay in `bench-results/` on the server. Hypotheses live under
+"Open questions" in STATUS.md until confirmed or ruled out.
