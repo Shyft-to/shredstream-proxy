@@ -19,30 +19,40 @@ implementation is measured the same way
 |---|---|---|---|---|---|---|
 | Production, port 23998 (15 destinations) | 2026-10-14 | 2 | 245 µs | 813 µs | 3.3 ms | 11.4 µs |
 | Production, port 23998, A/B baseline side | 2026-10-15 | 6 | 195 µs | — | 2.0 ms (median) | 12.2 µs |
+| **Box level**, 3 forwarders, kernel dedup **off** | 2026-10-15 | 4 | 280 µs | — | 4.5 ms (median) | ~7 cores in total |
+| **Box level**, 3 forwarders, kernel dedup **on** | 2026-10-15 | 4 | **191 µs** | — | **2.6 ms** (median) | **~1.35 cores** in total |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
-The production row rests on 2 runs; other runs put p99 between 1.2 and
+Box level (since 2026-10-15) is the north star: first arrival on any of the
+three ports → first copy leaving the box for each destination. Earlier rows
+are per forwarder and not directly comparable. The production row rests on
+2 runs; other runs put p99 between 1.2 and
 3.5 ms. The lab is ~5× slower than production (likely too few cores), so
 candidates are now tested on production traffic with alternating A/B runs.
 
 ## Key findings
 
-1. **The three sources deliver the same shreds.** 98.8% of shreds arrive on
+1. **Kernel dedup across the three sources works.** Dropping later copies of
+   each shred in an eBPF filter (forwarders unchanged) cut forwarder CPU by
+   81% (~7 → ~1.35 cores) and completion p50 by 32% (280 → 191 µs); first
+   destination p50 −26%. p99 −42% in the median but not yet significant.
+   Filter cost: 625 ns of kernel CPU per packet (~2.6% of one core).
+2. **The three sources deliver the same shreds.** 98.8% of shreds arrive on
    all three ports (5544, 23997, 23998), and all three forwarders send to the
    same 15 destinations, so the box does ~3× the necessary send work.
    23997 and 23998 each deliver first about half the time; 5544 is never
    first (12 ms behind at p50) but is the only source for ~1% of shreds.
-2. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
+3. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
    shreds/s, so send capacity during bursts matters as much as per-shred
    speed.
-3. **Most of the tail is queueing.** When little traffic arrived just before
+4. **Most of the tail is queueing.** When little traffic arrived just before
    a shred, the forwarder delivers it everywhere in ~70 µs (p50). Under normal
    load (86% of shreds) the same shred takes ~4.5× longer at p50 and 5–8× at
    p99, because it waits behind earlier shreds.
-4. **The biggest single cost is the coordinator waking the ~15 destination
+5. **The biggest single cost is the coordinator waking the ~15 destination
    worker threads one after another:** 65–130 µs per shred. Each extra thread
    hand-off costs ~10–13 µs, and each send ~4–8 µs.
-5. **Dead destinations are expensive.** Removing one local destination with
+6. **Dead destinations are expensive.** Removing one local destination with
    no listener halved p99 (6.2 → 3.1 ms) and sped up every other destination.
 
 ## Ruled out
@@ -64,8 +74,7 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- How much does kernel dedup across the three sources improve the
-  box-level north star, and what does it cost per packet?
+- Is the p99 improvement from kernel dedup real? (more A/B pairs)
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
 - How much would skipping connection tracking (firewall) for this traffic
@@ -82,9 +91,8 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. Kernel dedup across the three ports in front of the unchanged
-   forwarders (~3× less send work, always the first source's copy):
-   box-level baseline, then A/B by switching the filter off/on.
+2. Confirm the p99 effect of kernel dedup, then deploy it (attach at boot,
+   monitor counters).
 3. Then cut the cost per copy (bypass the UDP/IP stack) if still needed.
 
 ## Log
@@ -92,4 +100,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 built; limited by send capacity in bursts |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup: CPU −81%, p50 −32% |
