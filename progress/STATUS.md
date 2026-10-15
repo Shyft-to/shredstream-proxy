@@ -48,8 +48,9 @@ candidates are now tested on production traffic with alternating A/B runs.
 ## Open questions
 
 - Why is `shred-fanout` v1 slower than the current proxy (p50 439 vs
-  195 µs)? Suspected: its spinning threads share their cores with other
-  work and get switched out.
+  195 µs)? Its receive and hand-off are ~6× faster and its threads are not
+  preempted; the time is lost in or around the send. Suspected: queueing in
+  the bond/VLAN devices, or particular senders/destinations.
 
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
