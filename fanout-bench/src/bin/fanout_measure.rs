@@ -94,11 +94,11 @@ struct AnalyzeArgs {
     #[arg(long, default_value_t = 500)]
     edge_ms: u64,
 
-    /// Exclude stale re-sends: shreds whose slot, when they arrived, was
-    /// more than this many slots (~400 ms each) behind the newest slot seen
-    /// so far. Their live copies were forwarded before the capture, so they
-    /// would otherwise count as missing. Live shreds are at most 1 slot
-    /// behind; 5544's re-sends start at ~2 slots (~1 s). 0 disables.
+    /// Stale re-sends: a shred that was NOT forwarded to every destination
+    /// and arrived more than this many slots (~400 ms each) behind the
+    /// newest slot seen so far is a re-send whose live copy went out before
+    /// the capture; it is excluded instead of counted as missing. Forwarded
+    /// shreds always count, however late. 0 disables.
     #[arg(long, default_value_t = 2)]
     stale_slots: u64,
 
@@ -546,7 +546,13 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         if ing.first_ns < win_lo || ing.first_ns > win_hi {
             continue;
         }
-        if a.stale_slots > 0 && ing.slot_lag > a.stale_slots {
+        // A late shred that was forwarded counts like any other. One that was
+        // not, and arrived slots behind the newest, is a re-send whose live
+        // copy went out before the capture: excluded rather than "missing".
+        if a.stale_slots > 0
+            && ing.slot_lag > a.stale_slots
+            && !active.iter().all(|&d| egress.contains_key(&(*key, d)))
+        {
             stale_shreds += 1;
             by_port[ing.first_port].stale += 1;
             continue;
@@ -766,7 +772,7 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
     }
     if r.stale_shreds > 0 {
         println!(
-            "stale re-sends excluded: {} shreds arrived more than {} slots behind the newest slot (forwarded live before the capture)",
+            "stale re-sends excluded: {} undelivered shreds arrived more than {} slots behind the newest slot (forwarded live before the capture)",
             r.stale_shreds, r.stale_slots
         );
     }
