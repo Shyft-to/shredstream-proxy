@@ -18,6 +18,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$DIR/../ebpf/kfan.bpf.c"
 OBJ=/run/fanout-kfan.bpf.o
 DEV=${DEV:-bond0}
+DROP_PORTS=${DROP_PORTS:-}
 PREF=7700
 MAX_DESTS=32
 
