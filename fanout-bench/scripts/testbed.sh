@@ -116,11 +116,30 @@ run() {
             exit 1
         fi
 
-        local pcap="$dir/capture.pcap"
-        ip netns exec fb-fwd taskset -c "$TCPDUMP_CPU" \
-            tcpdump -i any -nn -s 160 -B 262144 --time-stamp-precision nano -w "$pcap" udp \
-            2>"$dir/tcpdump.log" &
-        local tcpd=$!
+        # CAPTURE=fwd (default): inside the forwarder's namespace.
+        # CAPTURE=ends: where packets leave the source and reach the sinks,
+        # outside the forwarder, so designs the kernel's taps cannot see
+        # (AF_XDP) are measured the same way as the others.
+        local pcaps=() logs=() tpids=()
+        if [ "${CAPTURE:-fwd}" = ends ]; then
+            pcaps=("$dir/src.pcap" "$dir/sink.pcap")
+            logs=("$dir/tcpdump-src.log" "$dir/tcpdump-sink.log")
+            ip netns exec fb-src taskset -c "$TCPDUMP_CPU" \
+                tcpdump -i fb-src0 -nn -s 160 -B 262144 --time-stamp-precision nano -w "${pcaps[0]}" udp \
+                2>"${logs[0]}" &
+            tpids+=($!)
+            ip netns exec fb-sink taskset -c "$TCPDUMP_CPU" \
+                tcpdump -i fb-sink0 -nn -s 160 -B 262144 --time-stamp-precision nano -w "${pcaps[1]}" udp \
+                2>"${logs[1]}" &
+            tpids+=($!)
+        else
+            pcaps=("$dir/capture.pcap")
+            logs=("$dir/tcpdump.log")
+            ip netns exec fb-fwd taskset -c "$TCPDUMP_CPU" \
+                tcpdump -i any -nn -s 160 -B 262144 --time-stamp-precision nano -w "${pcaps[0]}" udp \
+                2>"${logs[0]}" &
+            tpids+=($!)
+        fi
         sleep 1
 
         local c0 c1
@@ -131,22 +150,26 @@ run() {
         sleep 1
         c1=$(cpu_ms "$fwd")
 
-        kill -INT "$tcpd"; wait "$tcpd" 2>/dev/null || true
+        kill -INT "${tpids[@]}"; wait "${tpids[@]}" 2>/dev/null || true
         kill "$fwd" "$sink" 2>/dev/null || true
         wait "$fwd" "$sink" 2>/dev/null || true
 
-        local dropped lateness
-        dropped=$(grep -oP '\d+(?= packets dropped by kernel)' "$dir/tcpdump.log" || echo unknown)
+        local dropped=0 d lateness log pcap_args=() p
+        for log in "${logs[@]}"; do
+            d=$(grep -oP '\d+(?= packets dropped by kernel)' "$log" || echo unknown)
+            [ "$d" = "0" ] || dropped=$d
+        done
         lateness=$(grep -oP 'REPLAY_LATENESS_P99_US=\K[0-9.]+' "$dir/replay.log" || echo unknown)
         [ "$dropped" = "0" ] || echo "WARNING: tcpdump dropped $dropped packets; this run will be excluded" >&2
+        for p in "${pcaps[@]}"; do pcap_args+=(--pcap "$p"); done
 
-        "$BIN/fanout-measure" analyze --pcap "$pcap" --listen-port "$LISTEN_PORT" --dests "$all_dests" \
+        "$BIN/fanout-measure" analyze "${pcap_args[@]}" --listen-port "$LISTEN_PORT" --dests "$all_dests" \
             --label "$label" --results "$OUT/results.jsonl" --cpu-ms "$((c1 - c0))" \
-            --meta "run=$r" --meta "source=testbed" --meta "git=$git_rev" \
+            --meta "run=$r" --meta "source=testbed" --meta "git=$git_rev" --meta "capture=${CAPTURE:-fwd}" \
             --meta "tcpdump_dropped=$dropped" --meta "replay_lateness_p99_us=$lateness" \
             --show-dests 5 | tee "$dir/summary.txt"
 
-        [ "${KEEP_PCAP:-0}" = "1" ] || rm -f "$pcap"
+        [ "${KEEP_PCAP:-0}" = "1" ] || rm -f "${pcaps[@]}"
     done
 }
 
