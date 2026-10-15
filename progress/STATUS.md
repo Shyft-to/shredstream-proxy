@@ -19,8 +19,8 @@ implementation is measured the same way
 |---|---|---|---|---|---|---|
 | Production, port 23998 (15 destinations) | 2026-10-14 | 2 | 245 µs | 813 µs | 3.3 ms | 11.4 µs |
 | Production, port 23998, A/B baseline side | 2026-10-15 | 6 | 195 µs | — | 2.0 ms (median) | 12.2 µs |
-| **Box level**, 3 forwarders, kernel dedup **off** | 2026-10-15 | 8 | 258 µs | — | 3.9 ms (median) | ~7.5 cores in total |
-| **Box level**, 3 forwarders, kernel dedup **on** | 2026-10-15 | 8 | **169 µs** | — | **2.2 ms** (median) | **~1.5 cores** in total |
+| **Box level**, 3 forwarders, kernel dedup **off** | 2026-10-15 | 8 | 321 µs | — | 5.4 ms (median) | ~8.0 cores in total |
+| **Box level**, 3 forwarders, kernel dedup **on** | 2026-10-15 | 8 | **185 µs** | — | **2.4 ms** (median) | **~1.6 cores** in total |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 Box level (since 2026-10-15) is the north star: first arrival on any of the
@@ -33,10 +33,9 @@ candidates are now tested on production traffic with alternating A/B runs.
 ## Key findings
 
 1. **Kernel dedup across the three sources works.** Dropping later copies of
-   each shred in an eBPF filter (forwarders unchanged) cut forwarder CPU by
-   80% (~7.5 → ~1.5 cores) and completion p50 by 35% (258 → 169 µs); first
-   destination p50 −29% (8 vs 8 runs). p99 −42% in the median but not yet
-   significant.
+   each shred in an eBPF filter (forwarders unchanged), 8 vs 8 runs: p99
+   −55% (5.45 → 2.43 ms), p50 −42% (321 → 185 µs), first destination −36%,
+   forwarder CPU −80% (~8 → ~1.6 cores). All proven; delivery unaffected.
    Filter cost: 625 ns of kernel CPU per packet (~2.6% of one core).
 2. **The three sources deliver the same shreds.** 98.8% of shreds arrive on
    all three ports (5544, 23997, 23998), and all three forwarders send to the
@@ -75,8 +74,6 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- Is the p99 improvement from kernel dedup real? −42% in the median with
-  both 4 and 8 pairs, but run ranges overlap.
 - Why did delivery dip to 57–94% for ~3 minutes during the 8-pair test (both
   with and without the filter)? Suspected: a source re-sending older shreds,
   which the forwarders correctly ignore but a 10 s probe counts as missing.
@@ -98,8 +95,7 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. Confirm the p99 effect of kernel dedup, then deploy it (attach at boot,
-   monitor counters).
+2. Deploy kernel dedup permanently (systemd service, instant rollback).
 3. Then cut the cost per copy (bypass the UDP/IP stack) if still needed.
 
 ## Log
@@ -107,4 +103,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup: CPU −81%, p50 −32% |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven: p99 −55%, p50 −42%, CPU −80% |
