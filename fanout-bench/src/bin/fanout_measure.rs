@@ -251,6 +251,24 @@ struct Ingress {
     first_ns: u64,
     first_src: SocketAddrV4,
     multi_source: bool,
+    /// Index (into the listen ports) of the port it arrived on first.
+    first_port: usize,
+    /// Bit i set: it arrived on listen port i.
+    ports_seen: u32,
+}
+
+#[derive(Serialize)]
+struct PortStats {
+    port: u16,
+    /// Eligible shreds that arrived on this port.
+    shreds: u64,
+    /// Eligible shreds this port delivered before any other port.
+    first: u64,
+    /// Incomplete shreds (some destination never got a copy) that first
+    /// arrived on this port.
+    incomplete_first_here: u64,
+    /// Incomplete shreds that arrived on this port only.
+    incomplete_only_here: u64,
 }
 
 struct Egress {
@@ -328,6 +346,9 @@ struct AnalyzeResult {
     per_send: Summary,
     per_dest: Vec<DestResult>,
     load_window_us: u64,
+    /// Per listen port (box-level runs): arrivals, first deliveries, and
+    /// where incomplete shreds came from.
+    by_port: Vec<PortStats>,
     /// Latency grouped by how busy the forwarder was just before the shred
     /// arrived. Rising latency with load means queueing.
     by_recent_arrivals: Vec<LoadBucket>,
@@ -367,17 +388,23 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
             }
             let key = shred_key(p.payload, a.key_bytes, p.payload_len);
 
-            if a.listen_port.contains(&p.dst.port()) {
+            if let Some(port_i) = a.listen_port.iter().position(|&lp| lp == p.dst.port()) {
                 ingress
                     .entry(key)
                     .and_modify(|i| {
-                        i.first_ns = i.first_ns.min(p.ts_ns);
+                        if p.ts_ns < i.first_ns {
+                            i.first_ns = p.ts_ns;
+                            i.first_port = port_i;
+                        }
                         i.multi_source |= p.src != i.first_src;
+                        i.ports_seen |= 1 << port_i;
                     })
                     .or_insert(Ingress {
                         first_ns: p.ts_ns,
                         first_src: p.src,
                         multi_source: false,
+                        first_port: port_i,
+                        ports_seen: 1 << port_i,
                     });
                 continue;
             }
@@ -444,6 +471,17 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
     let mut timed: Vec<(u64, u64, u64)> = Vec::new();
     let (mut eligible, mut multi, mut missing, mut dups, mut negative) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut by_port: Vec<PortStats> = a
+        .listen_port
+        .iter()
+        .map(|&port| PortStats {
+            port,
+            shreds: 0,
+            first: 0,
+            incomplete_first_here: 0,
+            incomplete_only_here: 0,
+        })
+        .collect();
 
     for (key, ing) in &ingress {
         if ing.first_ns < win_lo || ing.first_ns > win_hi {
@@ -451,6 +489,10 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         }
         eligible += 1;
         multi += ing.multi_source as u64;
+        by_port[ing.first_port].first += 1;
+        for (i, ps) in by_port.iter_mut().enumerate() {
+            ps.shreds += (ing.ports_seen >> i & 1) as u64;
+        }
         let (mut worst, mut best, mut complete) = (0u64, u64::MAX, true);
         for &d in &active {
             match egress.get(&(*key, d)) {
@@ -478,6 +520,11 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
             completion.push(worst);
             first_dest.push(best);
             timed.push((ing.first_ns, worst, best));
+        } else if !active.is_empty() {
+            by_port[ing.first_port].incomplete_first_here += 1;
+            if ing.ports_seen.count_ones() == 1 {
+                by_port[ing.first_port].incomplete_only_here += 1;
+            }
         }
     }
 
@@ -552,6 +599,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         per_send: summarize(&mut per_send),
         per_dest: dest_results,
         load_window_us: a.load_window_us,
+        by_port,
         by_recent_arrivals,
     };
 
@@ -634,6 +682,19 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
             "WARNING: {} sends timestamped before their ingress",
             r.negative_latencies
         );
+    }
+    if r.by_port.len() > 1 {
+        println!("per listen port (shreds in the window)");
+        println!(
+            "  {:>6} {:>9} {:>9} {:>22} {:>22}",
+            "port", "arrived", "first", "incomplete, first here", "incomplete, only here"
+        );
+        for p in &r.by_port {
+            println!(
+                "  {:>6} {:>9} {:>9} {:>22} {:>22}",
+                p.port, p.shreds, p.first, p.incomplete_first_here, p.incomplete_only_here
+            );
+        }
     }
     println!(
         "latency vs recent load (shreds that arrived in the {} us before)",

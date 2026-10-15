@@ -192,6 +192,13 @@ box() {
         --meta "kernel_udp_errors=${drops:-none}" |
         tee "$OUT/$label-$stamp.txt"
 
+    # Keep the evidence when something went missing.
+    local delivery
+    delivery=$(grep -oP 'delivery \K[0-9.]+' "$OUT/$label-$stamp.txt" || echo 100)
+    if awk -v d="$delivery" 'BEGIN { exit !(d < 99.9) }'; then
+        echo "delivery ${delivery}% is below 99.9%: keeping the captures"
+        KEEP_PCAP=1
+    fi
     if [ "${KEEP_PCAP:-0}" = "1" ]; then
         echo "captures kept: $net_pcap $lo_pcap"
     else
