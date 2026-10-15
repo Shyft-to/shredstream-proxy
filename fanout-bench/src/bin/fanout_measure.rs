@@ -255,7 +255,32 @@ struct Ingress {
     first_port: usize,
     /// Bit i set: it arrived on listen port i.
     ports_seen: u32,
+    /// Solana slot from the shred header (0 if the packet is too short).
+    slot: u64,
 }
+
+/// Shred header: signature (64 bytes), variant (1), then the slot (u64 LE).
+fn shred_slot(payload: &[u8]) -> u64 {
+    payload
+        .get(65..73)
+        .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// How far behind the newest slot an incomplete shred was. Slots advance
+/// every ~400 ms, so old slots mean re-sent (replayed) shreds.
+#[derive(Serialize)]
+struct SlotLagBucket {
+    slots_behind: &'static str,
+    shreds: u64,
+}
+
+const SLOT_LAG_BUCKETS: [(u64, &str); 5] = [
+    (1, "0-1 (live)"),
+    (10, "2-10 (< 4 s old)"),
+    (150, "11-150 (< 1 min)"),
+    (750, "151-750 (< 5 min)"),
+    (u64::MAX, "> 750 (older)"),
+];
 
 #[derive(Serialize)]
 struct PortStats {
@@ -349,6 +374,8 @@ struct AnalyzeResult {
     /// Per listen port (box-level runs): arrivals, first deliveries, and
     /// where incomplete shreds came from.
     by_port: Vec<PortStats>,
+    /// Incomplete shreds by how many slots behind the newest slot they were.
+    incomplete_slot_lag: Vec<SlotLagBucket>,
     /// Latency grouped by how busy the forwarder was just before the shred
     /// arrived. Rising latency with load means queueing.
     by_recent_arrivals: Vec<LoadBucket>,
@@ -405,6 +432,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
                         multi_source: false,
                         first_port: port_i,
                         ports_seen: 1 << port_i,
+                        slot: shred_slot(p.payload),
                     });
                 continue;
             }
@@ -483,6 +511,14 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         })
         .collect();
 
+    let newest_slot = ingress
+        .values()
+        .filter(|i| i.first_ns >= win_lo && i.first_ns <= win_hi)
+        .map(|i| i.slot)
+        .max()
+        .unwrap_or(0);
+    let mut lag_counts = [0u64; SLOT_LAG_BUCKETS.len()];
+
     for (key, ing) in &ingress {
         if ing.first_ns < win_lo || ing.first_ns > win_hi {
             continue;
@@ -525,8 +561,22 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
             if ing.ports_seen.count_ones() == 1 {
                 by_port[ing.first_port].incomplete_only_here += 1;
             }
+            let lag = newest_slot.saturating_sub(ing.slot);
+            let b = SLOT_LAG_BUCKETS
+                .iter()
+                .position(|&(max, _)| lag <= max)
+                .unwrap();
+            lag_counts[b] += 1;
         }
     }
+    let incomplete_slot_lag: Vec<SlotLagBucket> = SLOT_LAG_BUCKETS
+        .iter()
+        .zip(lag_counts)
+        .map(|(&(_, label), shreds)| SlotLagBucket {
+            slots_behind: label,
+            shreds,
+        })
+        .collect();
 
     // Latency vs recent load: count arrivals in the window before each shred.
     let mut arrivals: Vec<u64> = ingress.values().map(|i| i.first_ns).collect();
@@ -600,6 +650,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         per_dest: dest_results,
         load_window_us: a.load_window_us,
         by_port,
+        incomplete_slot_lag,
         by_recent_arrivals,
     };
 
@@ -682,6 +733,12 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
             "WARNING: {} sends timestamped before their ingress",
             r.negative_latencies
         );
+    }
+    if r.missing_sends > 0 {
+        println!("incomplete shreds by age (slots behind the newest; ~400 ms per slot)");
+        for b in &r.incomplete_slot_lag {
+            println!("  {:<20} {}", b.slots_behind, b.shreds);
+        }
     }
     if r.by_port.len() > 1 {
         println!("per listen port (shreds in the window)");
