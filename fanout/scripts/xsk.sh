@@ -70,7 +70,8 @@ build() {
 }
 
 irq_of() { # IFACE QUEUE -> IRQ number of that queue's interrupt, if any
-    grep -E "[-[:space:]]$1-TxRx-$2\$" /proc/interrupts | awk -F: '{ gsub(/ /, "", $1); print $1 }' | head -1
+    # No match is normal (virtual devices have no per-queue interrupt).
+    { grep -E "[-[:space:]]$1-TxRx-$2\$" /proc/interrupts || true; } | awk -F: '{ gsub(/ /, "", $1); print $1 }' | head -1
 }
 
 wait_link() { # IFACE: wait until it is up again (and back in the bond)
@@ -228,7 +229,10 @@ names = ["first copies", "duplicates (dropped)", "to forwarder", "to normal stac
          "too short (passed)", "dedup error (passed)", "no arrival stamp"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
-for r in json.load(sys.stdin):
+rows = json.load(sys.stdin)
+if not isinstance(rows, list):
+    sys.exit("  (no counters yet: " + str(rows.get("error", rows)) + ")")
+for r in rows:
     r = r.get("formatted", r)
     name = names[num(r["key"])]
     total = sum(num(v["value"]) for v in r["values"])
