@@ -74,6 +74,9 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
+- Can a single process (or the kernel itself) fan out faster than three
+  proxies + kernel dedup? Three `shred-fanout` instances could not (worse
+  p99 at ~9× the CPU).
 - Why did delivery dip to 57–94% for ~3 minutes during the 8-pair test (both
   with and without the filter)? Suspected: a source re-sending older shreds,
   which the forwarders correctly ignore but a 10 s probe counts as missing.
@@ -103,4 +106,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven: p99 −55%, p50 −42%, CPU −80% |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven: p99 −55%, p50 −42%, CPU −80%; 3× shred-fanout not better than 3× proxy |
