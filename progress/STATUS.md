@@ -57,8 +57,12 @@ candidates are now tested on production traffic with alternating A/B runs.
   capacity limits `shred-fanout` (confirmed: 8 senders reach the first
   destination 5× faster, completion only matches baseline, at 9 spinning
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
-  stack (`AF_PACKET`, eBPF).
-
+  stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
+  spread across many kernel layers; tuning alone likely saves only 10–20%.
+- Do the three sources (ports 5544, 23997, 23998, same 15 destinations)
+  carry the same shreds? If so, one forwarder deduplicating across all three
+  would send up to 3× fewer copies, and always forward the fastest source's
+  copy.
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
 - How much would skipping connection tracking (firewall) for this traffic

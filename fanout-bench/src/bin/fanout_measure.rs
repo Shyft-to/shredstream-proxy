@@ -41,6 +41,24 @@ enum Cmd {
     Analyze(AnalyzeArgs),
     /// Compare two labels in a results file and say whether the metric moved.
     Compare(CompareArgs),
+    /// For several listen ports (one per source): how many shreds they share,
+    /// and which delivers each shared shred first.
+    Overlap(OverlapArgs),
+}
+
+#[derive(Args)]
+struct OverlapArgs {
+    /// pcap file(s) containing the ingress of all the ports.
+    #[arg(long, required = true)]
+    pcap: Vec<PathBuf>,
+
+    /// Listen ports to compare, comma separated.
+    #[arg(long, value_delimiter = ',', required = true)]
+    ports: Vec<u16>,
+
+    /// Leading payload bytes that identify a shred.
+    #[arg(long, default_value_t = 83)]
+    key_bytes: usize,
 }
 
 #[derive(Args)]
@@ -138,7 +156,76 @@ fn main() -> Res<()> {
     match Cli::parse().cmd {
         Cmd::Analyze(a) => analyze(a),
         Cmd::Compare(c) => compare(c),
+        Cmd::Overlap(o) => overlap(o),
     }
+}
+
+// ---------------------------------------------------------------- overlap --
+
+fn overlap(o: OverlapArgs) -> Res<()> {
+    let n = o.ports.len();
+    let port_idx: HashMap<u16, usize> = o.ports.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+    // shred -> first arrival per port
+    let mut seen: HashMap<u64, Vec<Option<u64>>> = HashMap::new();
+    for path in &o.pcap {
+        let mut reader = PcapReader::open(path)?;
+        while let Some(p) = reader.next_udp()? {
+            let Some(&i) = port_idx.get(&p.dst.port()) else { continue };
+            let key = shred_key(p.payload, o.key_bytes, p.payload_len);
+            let slot = &mut seen.entry(key).or_insert_with(|| vec![None; n])[i];
+            *slot = Some(slot.map_or(p.ts_ns, |t| t.min(p.ts_ns)));
+        }
+    }
+    if seen.is_empty() {
+        return Err("no packets to the given ports in the capture".into());
+    }
+
+    let per_port: Vec<usize> = (0..n).map(|i| seen.values().filter(|v| v[i].is_some()).count()).collect();
+    let mut on_k = vec![0usize; n + 1];
+    let mut wins = vec![0usize; n];
+    let mut behind: Vec<Vec<u64>> = vec![Vec::new(); n];
+    for v in seen.values() {
+        let times: Vec<(usize, u64)> = v.iter().enumerate().filter_map(|(i, t)| t.map(|t| (i, t))).collect();
+        on_k[times.len()] += 1;
+        if times.len() < 2 {
+            continue;
+        }
+        let &(winner, first) = times.iter().min_by_key(|&&(_, t)| t).unwrap();
+        wins[winner] += 1;
+        for &(i, t) in &times {
+            behind[i].push(t - first);
+        }
+    }
+    let shared: usize = on_k[2..].iter().sum();
+    let union = seen.len();
+    let total: usize = per_port.iter().sum();
+
+    println!("{union} distinct shreds across {n} ports; {total} arrivals in total");
+    for (k, count) in on_k.iter().enumerate().skip(1) {
+        println!("  seen on {k} port(s): {count} ({:.1}%)", *count as f64 * 100.0 / union as f64);
+    }
+    println!(
+        "forwarding each distinct shred once instead of once per port: {:.2}x fewer sends",
+        total as f64 / union as f64
+    );
+    println!("shreds seen on 2+ ports: {shared}");
+    println!(
+        "  {:>6} {:>10} {:>10} {:>18} {:>18}",
+        "port", "shreds", "first", "behind p50 (us)", "behind p90 (us)"
+    );
+    for i in 0..n {
+        let s = summarize(&mut behind[i]);
+        println!(
+            "  {:>6} {:>10} {:>9.1}% {:>18.1} {:>18.1}",
+            o.ports[i],
+            per_port[i],
+            if shared > 0 { wins[i] as f64 * 100.0 / shared as f64 } else { 0.0 },
+            s.p50_us,
+            s.p90_us
+        );
+    }
+    println!("(\"first\": share of shared shreds this port delivered first; \"behind\": how much later than the first arrival)");
+    Ok(())
 }
 
 // ---------------------------------------------------------------- analyze --
