@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# A/B test on live traffic: kernel dedup + userspace forwarders (A) vs kernel
+# fan-out, where the kernel sends every copy itself (B). The forwarders keep
+# running throughout; under B they simply receive nothing. Run as root.
+#
+# Usage:
+#   kfan-ab.sh PORTS DESTS PAIRS
+#
+# DESTS must be the forwarders' destination list (ip:port,...). On exit,
+# normal or not, whichever filter is attached is removed.
+#
+# Settings (environment): WARMUP_S (10), MEASURE_S (10), OUT (./bench-results)
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$DIR/../.." && pwd)"
+BIN=${BIN:-"$ROOT/target/release"}
+DEDUP="$ROOT/fanout/scripts/dedup.sh"
+KFAN="$ROOT/fanout/scripts/kfan.sh"
+OUT=${OUT:-./bench-results}
+WARMUP_S=${WARMUP_S:-10}
+MEASURE_S=${MEASURE_S:-10}
+
+[ $# -eq 3 ] || { sed -n '2,12p' "$0"; exit 1; }
+PORTS=$1 DESTS=$2 PAIRS=$3
+
+run_id=$(date +%Y%m%d-%H%M)
+a_label="dedup@$run_id"
+b_label="kfan@$run_id"
+
+finish() {
+    set +e
+    trap '' HUP INT TERM
+    "$KFAN" status
+    "$DEDUP" detach
+}
+"$DEDUP" detach >/dev/null
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for n in $(seq 1 "$PAIRS"); do
+    echo "--- $a_label ($n/$PAIRS)"
+    "$DEDUP" detach >/dev/null
+    "$DEDUP" attach "$PORTS" >/dev/null
+    sleep "$WARMUP_S"
+    OUT="$OUT" "$DIR/probe.sh" box "$PORTS" "$MEASURE_S" "$a_label" | grep -E 'NORTH STAR|delivery|duplicate|keeping'
+
+    echo "--- $b_label ($n/$PAIRS)"
+    "$DEDUP" detach >/dev/null
+    "$KFAN" attach "$PORTS" "$DESTS" | grep -v '^  '
+    sleep "$WARMUP_S"
+    OUT="$OUT" "$DIR/probe.sh" box "$PORTS" "$MEASURE_S" "$b_label" | grep -E 'NORTH STAR|delivery|duplicate|keeping'
+    "$KFAN" status | grep -E 'copies|no destinations'
+done
+"$DEDUP" detach >/dev/null
+
+for metric in completion.p99_us completion.p50_us first_dest.p50_us; do
+    echo
+    "$BIN/fanout-measure" compare --results "$OUT/box-results.jsonl" \
+        --baseline "$a_label" --candidate "$b_label" --metric "$metric"
+done

@@ -148,7 +148,8 @@ box() {
             echo "WARNING: port $p forwards to a different destination list; with dedup, destinations missing from some forwarders will miss shreds" >&2
         all_dests+=",$d"
     done
-    src_ports=$(tr ',' '\n' <<<"${src_ports#,}" | grep -v '^$' | sort -un | paste -sd,)
+    # The kernel fan-out (kfan) sends its copies from the listen ports themselves.
+    src_ports=$(tr ',' '\n' <<<"${src_ports#,},$ports" | grep -v '^$' | sort -un | paste -sd,)
     all_dests=$(tr ',' '\n' <<<"${all_dests#,}" | grep -v '^$' | sort -u | paste -sd,)
 
     local filter="udp and (" sep=""
