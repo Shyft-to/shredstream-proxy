@@ -10,8 +10,8 @@
 # it stops the test binary and starts the service again.
 #
 # Settings (environment): WARMUP_S (10), MEASURE_S (10), OUT (./bench-results),
-#   PROFILE=1 also runs `profile.sh stages` on each side after its measurement
-#   (summary printed; full histograms saved as stages-LABEL-*.txt).
+#   PROFILE=stages (or 1) / PROFILE=cpu also runs `profile.sh stages|cpu` on
+#   each side after its measurement (summary printed, full output saved).
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -95,10 +95,15 @@ run_side() {
         return 1
     fi
     OUT="$OUT" "$DIR/probe.sh" measure "$PORT" "$MEASURE_S" "$label" | grep -E 'NORTH STAR|delivery|duplicate|cpu |waiting for a CPU| tid '
-    if [ "${PROFILE:-0}" = "1" ]; then
+    case "${PROFILE:-0}" in
+    1 | stages)
         OUT="$OUT" "$DIR/profile.sh" stages "$PORT" "$MEASURE_S" "$label" |
             sed -n '/===== SUMMARY/,/===== HISTOGRAMS/p' | grep -v '^$'
-    fi
+        ;;
+    cpu)
+        OUT="$OUT" "$DIR/profile.sh" cpu "$PORT" "$MEASURE_S" "$label" | grep -vE '^#|^$' | head -45
+        ;;
+    esac
     kill "$child"
     wait "$child" 2>/dev/null || true
     child=""

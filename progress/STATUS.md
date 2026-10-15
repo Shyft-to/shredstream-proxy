@@ -53,10 +53,11 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 ## Open questions
 
-- Is send capacity what limits `shred-fanout` v1? It is 2–4× faster than
-  the proxy when traffic is light, but much slower in dense bursts (46% of
-  shreds arrive at over 64k/s). Each copy costs ~4.6 µs, too much for 4
-  senders with 4 destinations each. Testing with 8 senders.
+- Where do the ~4.6 µs per copy go, and how far can they be cut? Send
+  capacity limits `shred-fanout` (confirmed: 8 senders reach the first
+  destination 5× faster, completion only matches baseline, at 9 spinning
+  cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
+  stack (`AF_PACKET`, eBPF).
 
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
@@ -74,8 +75,8 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. Find out why `shred-fanout` v1 (busy-polling receiver, pinned senders)
-   is slower, and fix it.
+2. Cut the cost per copy in `shred-fanout` so a few threads absorb the
+   bursts: profile the send path, then tune or bypass the stack.
 3. Then an eBPF fan-out (no threads at all, cheaper per copy).
 
 ## Log
@@ -83,4 +84,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 built, slower than baseline |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 built; limited by send capacity in bursts |
