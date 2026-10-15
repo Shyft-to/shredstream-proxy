@@ -46,6 +46,9 @@ candidates are now tested on production traffic with alternating A/B runs.
   setting took effect).
 - **Kernel receive path:** only 2–8 µs from the kernel seeing a packet to it
   reaching the proxy's socket.
+- **`shred-fanout` threads being switched out:** they waited for a CPU only
+  ~17 ms in 10 s.
+- **Queueing in the bond/VLAN devices:** both use `noqueue`.
 - **Batching delay in the receiver:** the proxy does not hold packets back.
 
 ## Open questions
