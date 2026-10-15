@@ -68,9 +68,11 @@ struct AnalyzeArgs {
     #[arg(long, required = true)]
     pcap: Vec<PathBuf>,
 
-    /// UDP port the forwarder listens on. Packets to it are ingress.
-    #[arg(long)]
-    listen_port: u16,
+    /// UDP port(s) the forwarder(s) listen on, comma separated. Packets to
+    /// any of them are ingress; a shred's arrival is its first on any port
+    /// (box-level when several forwarders are measured together).
+    #[arg(long, value_delimiter = ',', required = true)]
+    listen_port: Vec<u16>,
 
     /// Expected destinations (comma separated). Packets to other addresses are
     /// ignored. If omitted, every destination that received a matched shred counts.
@@ -170,7 +172,9 @@ fn overlap(o: OverlapArgs) -> Res<()> {
     for path in &o.pcap {
         let mut reader = PcapReader::open(path)?;
         while let Some(p) = reader.next_udp()? {
-            let Some(&i) = port_idx.get(&p.dst.port()) else { continue };
+            let Some(&i) = port_idx.get(&p.dst.port()) else {
+                continue;
+            };
             let key = shred_key(p.payload, o.key_bytes, p.payload_len);
             let slot = &mut seen.entry(key).or_insert_with(|| vec![None; n])[i];
             *slot = Some(slot.map_or(p.ts_ns, |t| t.min(p.ts_ns)));
@@ -180,12 +184,18 @@ fn overlap(o: OverlapArgs) -> Res<()> {
         return Err("no packets to the given ports in the capture".into());
     }
 
-    let per_port: Vec<usize> = (0..n).map(|i| seen.values().filter(|v| v[i].is_some()).count()).collect();
+    let per_port: Vec<usize> = (0..n)
+        .map(|i| seen.values().filter(|v| v[i].is_some()).count())
+        .collect();
     let mut on_k = vec![0usize; n + 1];
     let mut wins = vec![0usize; n];
     let mut behind: Vec<Vec<u64>> = vec![Vec::new(); n];
     for v in seen.values() {
-        let times: Vec<(usize, u64)> = v.iter().enumerate().filter_map(|(i, t)| t.map(|t| (i, t))).collect();
+        let times: Vec<(usize, u64)> = v
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.map(|t| (i, t)))
+            .collect();
         on_k[times.len()] += 1;
         if times.len() < 2 {
             continue;
@@ -202,7 +212,10 @@ fn overlap(o: OverlapArgs) -> Res<()> {
 
     println!("{union} distinct shreds across {n} ports; {total} arrivals in total");
     for (k, count) in on_k.iter().enumerate().skip(1) {
-        println!("  seen on {k} port(s): {count} ({:.1}%)", *count as f64 * 100.0 / union as f64);
+        println!(
+            "  seen on {k} port(s): {count} ({:.1}%)",
+            *count as f64 * 100.0 / union as f64
+        );
     }
     println!(
         "forwarding each distinct shred once instead of once per port: {:.2}x fewer sends",
@@ -219,7 +232,11 @@ fn overlap(o: OverlapArgs) -> Res<()> {
             "  {:>6} {:>10} {:>9.1}% {:>18.1} {:>18.1}",
             o.ports[i],
             per_port[i],
-            if shared > 0 { wins[i] as f64 * 100.0 / shared as f64 } else { 0.0 },
+            if shared > 0 {
+                wins[i] as f64 * 100.0 / shared as f64
+            } else {
+                0.0
+            },
             s.p50_us,
             s.p90_us
         );
@@ -300,6 +317,8 @@ struct AnalyzeResult {
     /// Sends whose egress timestamp preceded the ingress (clamped to 0).
     negative_latencies: u64,
     egress_sends_per_s: f64,
+    /// Forwarder CPU time (user + sys) during the capture, all processes.
+    cpu_ms: Option<f64>,
     cpu_us_per_send: Option<f64>,
     /// NORTH STAR: first arrival -> last destination's copy handed to the NIC.
     completion: Summary,
@@ -348,7 +367,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
             }
             let key = shred_key(p.payload, a.key_bytes, p.payload_len);
 
-            if p.dst.port() == a.listen_port {
+            if a.listen_port.contains(&p.dst.port()) {
                 ingress
                     .entry(key)
                     .and_modify(|i| {
@@ -393,7 +412,11 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
     }
 
     if ingress.is_empty() {
-        return Err(format!("no ingress packets to port {} in the capture", a.listen_port).into());
+        return Err(format!(
+            "no ingress packets to port(s) {:?} in the capture",
+            a.listen_port
+        )
+        .into());
     }
 
     // Destinations to judge completeness against. Without an explicit list,
@@ -419,7 +442,8 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
     let mut completion = Vec::new();
     let mut first_dest = Vec::new();
     let mut timed: Vec<(u64, u64, u64)> = Vec::new();
-    let (mut eligible, mut multi, mut missing, mut dups, mut negative) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut eligible, mut multi, mut missing, mut dups, mut negative) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
 
     for (key, ing) in &ingress {
         if ing.first_ns < win_lo || ing.first_ns > win_hi {
@@ -464,7 +488,8 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
     let mut load_completion: Vec<Vec<u64>> = vec![Vec::new(); LOAD_EDGES.len()];
     let mut load_first: Vec<Vec<u64>> = vec![Vec::new(); LOAD_EDGES.len()];
     for &(t, worst, best) in &timed {
-        let recent = arrivals.partition_point(|&x| x < t) - arrivals.partition_point(|&x| x < t.saturating_sub(window_ns));
+        let recent = arrivals.partition_point(|&x| x < t)
+            - arrivals.partition_point(|&x| x < t.saturating_sub(window_ns));
         let b = LOAD_EDGES.partition_point(|&edge| edge <= recent) - 1;
         load_completion[b].push(worst);
         load_first[b].push(best);
@@ -477,7 +502,10 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         })
         .collect();
 
-    let orphan_egress = egress.keys().filter(|(k, _)| !ingress.contains_key(k)).count();
+    let orphan_egress = egress
+        .keys()
+        .filter(|(k, _)| !ingress.contains_key(k))
+        .count();
     let capture_seconds = t_max.saturating_sub(t_min) as f64 / 1e9;
     let expected = eligible * active.len() as u64;
     let delivered = expected - missing;
@@ -514,6 +542,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         } else {
             0.0
         },
+        cpu_ms: a.cpu_ms,
         cpu_us_per_send: a
             .cpu_ms
             .filter(|_| !egress.is_empty())
@@ -556,17 +585,33 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
         "NORTH STAR  p99 fan-out completion: {:.1} us",
         r.completion.p99_us
     );
-    println!("  completion (first arrival -> last dest)  {}", fmt_summary(&r.completion));
-    println!("  first dest (first arrival -> first dest) {}", fmt_summary(&r.first_dest));
-    println!("  every send                               {}", fmt_summary(&r.per_send));
+    println!(
+        "  completion (first arrival -> last dest)  {}",
+        fmt_summary(&r.completion)
+    );
+    println!(
+        "  first dest (first arrival -> first dest) {}",
+        fmt_summary(&r.first_dest)
+    );
+    println!(
+        "  every send                               {}",
+        fmt_summary(&r.per_send)
+    );
     println!("guardrails");
     println!(
         "  delivery {:.3}%  (missing {}, complete shreds {}/{})",
         r.delivery_pct, r.missing_sends, r.complete_shreds, r.eligible_shreds
     );
-    println!("  duplicate sends {}", r.duplicate_sends);
+    println!(
+        "  duplicate sends {} (extra copies of a shred to the same destination; {:.2} copies per send)",
+        r.duplicate_sends,
+        (r.per_send.count as u64 + r.duplicate_sends) as f64 / r.per_send.count.max(1) as f64
+    );
     match r.cpu_us_per_send {
-        Some(c) => println!("  cpu {c:.3} us per send"),
+        Some(c) => println!(
+            "  cpu {c:.3} us per send ({:.0} ms over the capture)",
+            r.cpu_ms.unwrap_or(0.0)
+        ),
         None => println!("  cpu (not measured)"),
     }
     println!(
@@ -574,7 +619,9 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
         r.capture_seconds, r.ingress_unique, r.multi_source_pct, r.dests, r.egress_sends_per_s
     );
     if !r.nanosecond_timestamps {
-        println!("WARNING: capture has microsecond timestamps; use tcpdump --time-stamp-precision nano");
+        println!(
+            "WARNING: capture has microsecond timestamps; use tcpdump --time-stamp-precision nano"
+        );
     }
     if r.short_key_packets > 0 {
         println!(
@@ -583,7 +630,10 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
         );
     }
     if r.negative_latencies > 0 {
-        println!("WARNING: {} sends timestamped before their ingress", r.negative_latencies);
+        println!(
+            "WARNING: {} sends timestamped before their ingress",
+            r.negative_latencies
+        );
     }
     println!(
         "latency vs recent load (shreds that arrived in the {} us before)",
@@ -593,10 +643,18 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
         "  {:>8} {:>9} {:>16} {:>16} {:>16}",
         "arrivals", "shreds", "completion p50", "completion p99", "first dest p50"
     );
-    for b in r.by_recent_arrivals.iter().filter(|b| b.completion.count > 0) {
+    for b in r
+        .by_recent_arrivals
+        .iter()
+        .filter(|b| b.completion.count > 0)
+    {
         println!(
             "  {:>8} {:>9} {:>16.1} {:>16.1} {:>16.1}",
-            b.recent_arrivals, b.completion.count, b.completion.p50_us, b.completion.p99_us, b.first_dest.p50_us
+            b.recent_arrivals,
+            b.completion.count,
+            b.completion.p50_us,
+            b.completion.p99_us,
+            b.first_dest.p50_us
         );
     }
     println!("per destination (slowest p99 first)");
@@ -637,7 +695,8 @@ fn load_side(rows: &[Value], label: &str, pointer: &str, c: &CompareArgs) -> Sid
             continue;
         }
         side.values.push(v);
-        side.delivery.push(row["delivery_pct"].as_f64().unwrap_or(0.0));
+        side.delivery
+            .push(row["delivery_pct"].as_f64().unwrap_or(0.0));
         side.duplicate_sends += row["duplicate_sends"].as_u64().unwrap_or(0);
     }
     side
@@ -656,7 +715,9 @@ fn median(v: &[f64]) -> f64 {
 
 fn min_max(v: &[f64]) -> (f64, f64) {
     v.iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| (lo.min(x), hi.max(x)))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+            (lo.min(x), hi.max(x))
+        })
 }
 
 /// Probability that every candidate run beats every baseline run by chance
@@ -678,10 +739,16 @@ fn compare(c: CompareArgs) -> Res<()> {
     let cand = load_side(&rows, &c.candidate, &pointer, &c);
 
     println!("metric: {} (lower is better)", c.metric);
-    println!("{:<12} {:>5} {:>10} {:>10} {:>10} {:>9}", "", "runs", "median", "min", "max", "excluded");
+    println!(
+        "{:<12} {:>5} {:>10} {:>10} {:>10} {:>9}",
+        "", "runs", "median", "min", "max", "excluded"
+    );
     for (name, s) in [(&c.baseline, &base), (&c.candidate, &cand)] {
         if s.values.is_empty() {
-            println!("{name:<12} {:>5} {:>10} {:>10} {:>10} {:>9}", 0, "-", "-", "-", s.excluded);
+            println!(
+                "{name:<12} {:>5} {:>10} {:>10} {:>10} {:>9}",
+                0, "-", "-", "-", s.excluded
+            );
             continue;
         }
         let (lo, hi) = min_max(&s.values);
@@ -708,7 +775,10 @@ fn compare(c: CompareArgs) -> Res<()> {
     let verdict = if c_hi < b_lo {
         format!("IMPROVED (every candidate run beat every baseline run; chance if no real effect {:.1}%)", chance * 100.0)
     } else if c_lo > b_hi {
-        format!("REGRESSED (every candidate run was worse; chance if no real effect {:.1}%)", chance * 100.0)
+        format!(
+            "REGRESSED (every candidate run was worse; chance if no real effect {:.1}%)",
+            chance * 100.0
+        )
     } else {
         "NO SIGNIFICANT CHANGE (run ranges overlap)".to_string()
     };

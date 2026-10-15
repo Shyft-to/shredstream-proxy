@@ -64,8 +64,8 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- Do the destinations need one copy per shred, or one per source? Merging
-  the three forwarders depends on it.
+- How much does kernel dedup across the three sources improve the
+  box-level north star, and what does it cost per packet?
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
 - How much would skipping connection tracking (firewall) for this traffic
@@ -82,9 +82,9 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. One forwarder for all three ports, deduplicating across them (~3× less
-   send work, always the first source's copy), measured with a box-level
-   north star.
+2. Kernel dedup across the three ports in front of the unchanged
+   forwarders (~3× less send work, always the first source's copy):
+   box-level baseline, then A/B by switching the filter off/on.
 3. Then cut the cost per copy (bypass the UDP/IP stack) if still needed.
 
 ## Log
