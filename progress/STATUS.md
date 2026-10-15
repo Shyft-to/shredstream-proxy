@@ -27,17 +27,22 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 ## Key findings
 
-1. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
+1. **The three sources deliver the same shreds.** 98.8% of shreds arrive on
+   all three ports (5544, 23997, 23998), and all three forwarders send to the
+   same 15 destinations, so the box does ~3× the necessary send work.
+   23997 and 23998 each deliver first about half the time; 5544 is never
+   first (12 ms behind at p50) but is the only source for ~1% of shreds.
+2. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
    shreds/s, so send capacity during bursts matters as much as per-shred
    speed.
-2. **Most of the tail is queueing.** When little traffic arrived just before
+3. **Most of the tail is queueing.** When little traffic arrived just before
    a shred, the forwarder delivers it everywhere in ~70 µs (p50). Under normal
    load (86% of shreds) the same shred takes ~4.5× longer at p50 and 5–8× at
    p99, because it waits behind earlier shreds.
-3. **The biggest single cost is the coordinator waking the ~15 destination
+4. **The biggest single cost is the coordinator waking the ~15 destination
    worker threads one after another:** 65–130 µs per shred. Each extra thread
    hand-off costs ~10–13 µs, and each send ~4–8 µs.
-4. **Dead destinations are expensive.** Removing one local destination with
+5. **Dead destinations are expensive.** Removing one local destination with
    no listener halved p99 (6.2 → 3.1 ms) and sped up every other destination.
 
 ## Ruled out
@@ -59,10 +64,8 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- Do the three sources (ports 5544, 23997, 23998, same 15 destinations)
-  carry the same shreds? If so, one forwarder deduplicating across all three
-  would send up to 3× fewer copies, and always forward the fastest source's
-  copy.
+- Do the destinations need one copy per shred, or one per source? Merging
+  the three forwarders depends on it.
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
 - How much would skipping connection tracking (firewall) for this traffic
@@ -79,9 +82,10 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. Cut the cost per copy in `shred-fanout` so a few threads absorb the
-   bursts: profile the send path, then tune or bypass the stack.
-3. Then an eBPF fan-out (no threads at all, cheaper per copy).
+2. One forwarder for all three ports, deduplicating across them (~3× less
+   send work, always the first source's copy), measured with a box-level
+   north star.
+3. Then cut the cost per copy (bypass the UDP/IP stack) if still needed.
 
 ## Log
 
