@@ -27,6 +27,28 @@ nstat_line() {
     nstat -z 2>/dev/null | awk '/UdpRcvbufErrors|UdpSndbufErrors|UdpInErrors/ { printf "%s=%s ", $1, $2 }'
 }
 
+# Per thread: "tid comm run-queue-wait-ns" (time ready to run but not on a CPU).
+sched_snapshot() {
+    local t
+    for t in /proc/"$1"/task/*; do
+        printf '%s %s %s\n' "${t##*/}" "$(tr ' ' '_' <"$t/comm" 2>/dev/null)" "$(awk '{ print $2 }' "$t/schedstat" 2>/dev/null)"
+    done
+}
+
+# Total run-queue wait (ms) of all threads between two snapshots.
+runq_total_ms() {
+    awk 'NR == FNR { w[$1] = $3; next } ($1 in w) { s += ($3 - w[$1]) / 1e6 } END { printf "%.1f", s }' "$1" "$2"
+}
+
+# Prints the threads that waited longest for a CPU between two snapshots.
+sched_report() {
+    local before=$1 after=$2 secs=$3
+    echo "waiting for a CPU during capture: $(runq_total_ms "$before" "$after") ms over all threads; longest:"
+    awk 'NR == FNR { w[$1] = $3; next } ($1 in w) { print ($3 - w[$1]) / 1e6, $2, $1 }' "$before" "$after" |
+        sort -rn | head -5 |
+        awk -v secs="$secs" '{ printf "  %-16s tid %-7s %8.1f ms  (%.2f%% of the capture)\n", $2, $3, $1, $1 / (secs * 10) }'
+}
+
 measure() {
     local port=$1 secs=${2:-10} label=${3:-prod-$1}
     local pid
@@ -60,8 +82,11 @@ measure() {
     # is seen three times (VLAN device, bond, slave), tripling the volume.
     # The bond sees ingress plus all network egress; loopback sees local consumers.
     nstat -n
-    local c0
+    local c0 sched_before sched_after
     c0=$(cpu_ms "$pid")
+    sched_before=$(mktemp)
+    sched_after=$(mktemp)
+    sched_snapshot "$pid" >"$sched_before"
     timeout --signal=INT "$secs" tcpdump -i "$IN_IF" -nn -s 160 -B 262144 --time-stamp-precision nano \
         -w "$net_pcap" "$filter" 2>"$net_pcap.log" &
     local t1=$!
@@ -71,6 +96,7 @@ measure() {
     wait "$t1" "$t2" || true
     local c1 drops
     c1=$(cpu_ms "$pid")
+    sched_snapshot "$pid" >"$sched_after"
     drops=$(nstat_line)
 
     local d1 d2
@@ -80,12 +106,16 @@ measure() {
     [ "$d1" = "0" ] && [ "$d2" = "0" ] || dropped="$d1+$d2"
     [ "$dropped" = "0" ] || echo "WARNING: tcpdump dropped packets ($dropped); treat this result with caution" >&2
     echo "kernel UDP errors during capture: ${drops:-none}"
+    local runq_ms
+    runq_ms=$(runq_total_ms "$sched_before" "$sched_after")
+    sched_report "$sched_before" "$sched_after" "$secs" | tee "$OUT/$label-$stamp-sched.txt"
+    rm -f "$sched_before" "$sched_after"
 
     "$BIN/fanout-measure" analyze --pcap "$net_pcap" --pcap "$lo_pcap" --listen-port "$port" \
         --dests "$dests" --egress-src-ports "$src_ports" --label "$label" \
         --results "$OUT/prod-results.jsonl" --cpu-ms "$((c1 - c0))" \
         --meta "source=production" --meta "pid=$pid" --meta "tcpdump_dropped=$dropped" \
-        --meta "kernel_udp_errors=${drops:-none}" |
+        --meta "kernel_udp_errors=${drops:-none}" --meta "runq_wait_ms=$runq_ms" |
         tee "$OUT/$label-$stamp.txt"
 
     if [ "${KEEP_PCAP:-0}" = "1" ]; then

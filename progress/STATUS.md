@@ -18,6 +18,7 @@ implementation is measured the same way
 | Where | Date | Runs | p50 | p90 | p99 | CPU per send |
 |---|---|---|---|---|---|---|
 | Production, port 23998 (15 destinations) | 2026-10-14 | 2 | 245 µs | 813 µs | 3.3 ms | 11.4 µs |
+| Production, port 23998, A/B baseline side | 2026-10-15 | 6 | 195 µs | — | 2.0 ms (median) | 12.2 µs |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 The production row rests on 2 runs; other runs put p99 between 1.2 and
@@ -46,6 +47,10 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 ## Open questions
 
+- Why is `shred-fanout` v1 slower than the current proxy (p50 439 vs
+  195 µs)? Suspected: its spinning threads share their cores with other
+  work and get switched out.
+
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
 - How much would skipping connection tracking (firewall) for this traffic
@@ -62,9 +67,8 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. A/B test our new forwarder `shred-fanout` (branch `fanout-opt`:
-   busy-polling receiver, pinned senders, no sleeping hand-offs) on
-   production.
+2. Find out why `shred-fanout` v1 (busy-polling receiver, pinned senders)
+   is slower, and fix it.
 3. Then an eBPF fan-out (no threads at all, cheaper per copy).
 
 ## Log
@@ -72,4 +76,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); new forwarder `shred-fanout` built |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 built, slower than baseline |

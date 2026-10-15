@@ -92,7 +92,7 @@ run_side() {
         echo "$bin is not listening on $PORT; see $logdir/$label-$n.log" >&2
         return 1
     fi
-    OUT="$OUT" "$DIR/probe.sh" measure "$PORT" "$MEASURE_S" "$label" | grep -E 'NORTH STAR|delivery|duplicate|cpu '
+    OUT="$OUT" "$DIR/probe.sh" measure "$PORT" "$MEASURE_S" "$label" | grep -E 'NORTH STAR|delivery|duplicate|cpu |waiting for a CPU| tid '
     kill "$child"
     wait "$child" 2>/dev/null || true
     child=""
