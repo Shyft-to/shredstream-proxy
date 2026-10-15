@@ -56,6 +56,10 @@ echo "plan:     $PAIRS pairs of $a_label / $b_label, ${WARMUP_S}s warmup + ${MEA
 
 child=""
 restore() {
+    # Best effort from here on: getting the service back matters more than
+    # any individual step failing.
+    set +e
+    trap '' HUP INT TERM
     if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then
         kill "$child" 2>/dev/null || true
         wait "$child" 2>/dev/null || true
@@ -70,6 +74,11 @@ restore() {
 # the test binary.
 systemctl stop "$unit"
 trap restore EXIT
+# Turn hang-up (e.g. SSH drops), Ctrl-C and kill into a normal exit so the
+# EXIT trap always restarts the service. Run long tests inside tmux anyway.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 wait_port_free
 
 run_side() {
