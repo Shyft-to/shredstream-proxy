@@ -86,10 +86,11 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- Can the kernel fan-out be spread over several CPUs? It costs only ~0.23
-  cores in total (~1.9 µs per copy), but a burst's copies all land on the
-  one CPU receiving that source, which saturates (p50 ~90 µs, p99
-  ~300 µs).
+- How cheap can each kernel copy get? Today ~1.9 µs, mostly the VLAN and
+  bond device layers (~36%) and IOMMU mapping/unmapping; a burst's copies
+  all land on one CPU, which saturates (p50 ~90 µs, p99 ~300 µs). Plan:
+  send straight to the NIC ports, then IOMMU passthrough; spread over CPUs
+  only if still needed.
 - Which process still sends to the old dead IPs (`FAILED` in the neighbour
   table)?
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
