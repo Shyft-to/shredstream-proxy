@@ -127,7 +127,7 @@ run() {
         c0=$(cpu_ms "$fwd")
         ip netns exec fb-src taskset -c "$REPLAY_CPU" "$BIN/shred-replay" \
             --pcap "$CORPUS" --port "$CORPUS_PORT" --target "$FWD_IP:$LISTEN_PORT" \
-            --src-ips "$SRC_IPS" --loops "$LOOPS" >"$dir/replay.log" 2>&1
+            --src-ips "$SRC_IPS" --loops "$LOOPS" --salt "$(date +%s%N | cut -c6-14)" >"$dir/replay.log" 2>&1
         sleep 1
         c1=$(cpu_ms "$fwd")
 

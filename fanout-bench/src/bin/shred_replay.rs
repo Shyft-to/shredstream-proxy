@@ -41,6 +41,12 @@ struct Args {
     /// Time scale: 2.0 plays twice as fast.
     #[arg(long, default_value_t = 1.0)]
     speed: f64,
+
+    /// XORed into signature bytes 56..60 of every packet, so separate replays
+    /// of the same capture look like new shreds to deduplicating forwarders.
+    /// 0 replays the capture unchanged.
+    #[arg(long, default_value_t = 0)]
+    salt: u32,
 }
 
 struct Pkt {
@@ -115,13 +121,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             };
             lateness.push((now - due).as_nanos() as u64);
 
-            let data: &[u8] = if lp == 0 || p.data.len() < 64 {
+            let data: &[u8] = if (lp == 0 && args.salt == 0) || p.data.len() < 64 {
                 &p.data
             } else {
                 scratch.clear();
                 scratch.extend_from_slice(&p.data);
                 scratch[63] ^= lp as u8;
                 scratch[62] ^= (lp >> 8) as u8;
+                for (b, s) in scratch[56..60].iter_mut().zip(args.salt.to_le_bytes()) {
+                    *b ^= s;
+                }
                 &scratch
             };
             match sockets[p.src].send_to(data, args.target) {
