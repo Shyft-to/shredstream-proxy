@@ -24,6 +24,7 @@ implementation is measured the same way
 | **Box level, kernel fan-out** (no userspace forwarding) | 2026-10-15 | 6 | **89 µs** | — | **0.31 ms** (median) | **~0.23 cores** (kernel) |
 | **Box level, kernel fan-out, direct to NIC ports** (measured at the ports) | 2026-10-15 | 10 × 60 s | **86 µs** | — | **0.27 ms** (median) | kernel only |
 | **AF_XDP zero-copy forwarder** (own measurement: NIC arrival → copies handed to the NIC) | 2026-10-15 | 8 × 10 s | **~44 µs** | — | ~0.9 ms (median; 0.31–1.2) | 1 busy-polling core, ~6% used |
+| **AF_XDP + local-send thread**, cores 33/34, interrupts 35 (own measurement) | 2026-10-15 | 6 × 10 s | **~11.5 µs** | — | **~66 µs** (p99.9 ~100) | 2 busy-polling cores, 2.3 µs/shred |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 Box level (since 2026-10-15) is the north star: first arrival on any of the
