@@ -63,7 +63,7 @@ struct dest {
 	__be32 saddr;
 	__be32 daddr;
 	__be16 dport;
-	__u16 pad;
+	__u16 vlan; /* 802.1Q tag the NIC should add (sending straight to a port); 0 = none */
 };
 
 struct {
@@ -124,6 +124,7 @@ int kfan(struct __sk_buff *skb)
 	__u32 ihl, l4, i, zero = 0;
 	__be32 cur_saddr, cur_daddr;
 	__be16 sport;
+	__u16 cur_vlan;
 	__u16 port, no_csum = 0;
 	long ret;
 
@@ -177,6 +178,7 @@ int kfan(struct __sk_buff *skb)
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, check), &no_csum, sizeof(no_csum), 0);
 	cur_saddr = ip.saddr;
 	cur_daddr = ip.daddr;
+	cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
 
 	for (i = 0; i < MAX_DESTS; i++) {
 		__u32 k = i;
@@ -197,6 +199,14 @@ int kfan(struct __sk_buff *skb)
 			cur_daddr = d->daddr;
 		}
 		bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, dest), &d->dport, sizeof(d->dport), 0);
+		/* The tag lives in packet metadata; the NIC inserts it on send. */
+		if (d->vlan != cur_vlan) {
+			if (cur_vlan)
+				bpf_skb_vlan_pop(skb);
+			if (d->vlan)
+				bpf_skb_vlan_push(skb, bpf_htons(ETH_P_8021Q), d->vlan);
+			cur_vlan = d->vlan;
+		}
 		if (bpf_clone_redirect(skb, d->ifindex, 0))
 			count(STAT_CLONE_FAIL);
 		else

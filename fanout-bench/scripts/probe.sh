@@ -158,40 +158,45 @@ box() {
     filter+=")"
 
     mkdir -p "$OUT"
-    local stamp net_pcap lo_pcap
+    # Capture on the physical ports under IN_IF (the bond's members) plus
+    # loopback: arrivals and departures both pass there, whichever path a copy
+    # takes (UDP stack, VLAN + bond, or straight to a port), so every mode is
+    # timed at the same point.
+    local stamp ifaces=() pcaps=() logs=() tpids=() i
     stamp=$(date +%Y%m%d-%H%M%S)
-    net_pcap="$CAP_DIR/box-$stamp-net.pcap"
-    lo_pcap="$CAP_DIR/box-$stamp-lo.pcap"
-    echo "ports $ports (pids ${pids[*]}), $(tr ',' '\n' <<<"$all_dests" | wc -l) destinations, ${secs}s capture"
+    if [ -e "/sys/class/net/$IN_IF/bonding/slaves" ]; then
+        read -ra ifaces <"/sys/class/net/$IN_IF/bonding/slaves"
+    else
+        ifaces=("$IN_IF")
+    fi
+    ifaces+=(lo)
+    echo "ports $ports (pids ${pids[*]}), $(tr ',' '\n' <<<"$all_dests" | wc -l) destinations, ${secs}s capture on ${ifaces[*]}"
 
     # One process may own several ports; count each process once.
     cpu_sum() { local s=0 x; for x in $(printf '%s\n' "${pids[@]}" | sort -u); do s=$((s + $(cpu_ms "$x"))); done; echo "$s"; }
     nstat -n
     local c0 c1 drops
     c0=$(cpu_sum)
-    timeout --signal=INT "$secs" tcpdump -i "$IN_IF" -nn -s 160 -B 262144 --time-stamp-precision nano \
-        -w "$net_pcap" "$filter" 2>"$net_pcap.log" &
-    local t1=$!
-    timeout --signal=INT "$secs" tcpdump -i lo -nn -s 160 -B 65536 --time-stamp-precision nano \
-        -w "$lo_pcap" "$filter" 2>"$lo_pcap.log" &
-    local t2=$!
-    wait "$t1" "$t2" || true
+    for i in "${ifaces[@]}"; do
+        pcaps+=("$CAP_DIR/box-$stamp-$i.pcap")
+        logs+=("$CAP_DIR/box-$stamp-$i.log")
+        timeout --signal=INT "$secs" tcpdump -i "$i" -nn -s 160 -B 262144 --time-stamp-precision nano             -w "${pcaps[-1]}" "$filter" 2>"${logs[-1]}" &
+        tpids+=($!)
+    done
+    wait "${tpids[@]}" || true
     c1=$(cpu_sum)
     drops=$(nstat_line)
 
-    local d1 d2 dropped
-    d1=$(grep -oP '\d+(?= packets dropped by kernel)' "$net_pcap.log" || echo unknown)
-    d2=$(grep -oP '\d+(?= packets dropped by kernel)' "$lo_pcap.log" || echo unknown)
-    dropped=$d1
-    [ "$d1" = "0" ] && [ "$d2" = "0" ] || dropped="$d1+$d2"
+    local dropped=0 d log pcap_args=()
+    for log in "${logs[@]}"; do
+        d=$(grep -oP '\d+(?= packets dropped by kernel)' "$log" || echo unknown)
+        [ "$d" = "0" ] || dropped="$d"
+    done
     [ "$dropped" = "0" ] || echo "WARNING: tcpdump dropped packets ($dropped); treat this result with caution" >&2
     echo "kernel UDP errors during capture: ${drops:-none}"
+    for i in "${pcaps[@]}"; do pcap_args+=(--pcap "$i"); done
 
-    "$BIN/fanout-measure" analyze --pcap "$net_pcap" --pcap "$lo_pcap" --listen-port "$ports" \
-        --dests "$all_dests" --egress-src-ports "$src_ports" --label "$label" \
-        --results "$OUT/box-results.jsonl" --cpu-ms "$((c1 - c0))" \
-        --meta "source=box" --meta "ports=$ports" --meta "tcpdump_dropped=$dropped" \
-        --meta "kernel_udp_errors=${drops:-none}" |
+    "$BIN/fanout-measure" analyze "${pcap_args[@]}" --listen-port "$ports"         --dests "$all_dests" --egress-src-ports "$src_ports" --label "$label"         --results "$OUT/box-results.jsonl" --cpu-ms "$((c1 - c0))"         --meta "source=box" --meta "ports=$ports" --meta "tcpdump_dropped=$dropped"         --meta "capture=${ifaces[*]}" --meta "kernel_udp_errors=${drops:-none}" |
         tee "$OUT/$label-$stamp.txt"
 
     # Keep the evidence when something went missing.
@@ -202,11 +207,11 @@ box() {
         KEEP_PCAP=1
     fi
     if [ "${KEEP_PCAP:-0}" = "1" ]; then
-        echo "captures kept: $net_pcap $lo_pcap"
+        echo "captures kept: ${pcaps[*]}"
     else
-        rm -f "$net_pcap" "$lo_pcap"
+        rm -f "${pcaps[@]}"
     fi
-    rm -f "$net_pcap.log" "$lo_pcap.log"
+    rm -f "${logs[@]}"
 }
 
 corpus() {
