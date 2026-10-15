@@ -1,8 +1,10 @@
 #!/usr/bin/env bpftrace
 /*
- * Stage timings for one jito-shredstream-proxy forward-only process.
+ * Stage timings for one forwarder process (jito-shredstream-proxy or shred-fanout).
  *
- * Follows a shred through the kernel and the proxy's threads:
+ * Follows a shred through the kernel and the forwarder threads. Stages S0, S1,
+ * S8, H (receive -> send) and P (preempted) work for any forwarder; S2-S7 and
+ * run-queue delay are specific to jito-shredstream-proxy:
  *   kernel receive -> packet queued on socket -> receive thread (ssListen*) -> coordinator
  *   (ssPxyTx_*) -> one worker per destination (ssPxyDst_*) -> sendmmsg
  *
@@ -72,7 +74,43 @@ tracepoint:syscalls:sys_exit_recvmmsg /pid == $1 && args->ret > 0/
 		delete(@wake[tid]);
 	}
 	@recv_done[tid] = nsecs;
+	@last_recv = nsecs;
 	@packets_per_recvmmsg = hist(args->ret);
+}
+
+/* Design-neutral hand-off: most recent receive -> each sendmmsg starting.
+ * Approximate (uses the latest receive, so it understates under backlog),
+ * but comparable between the proxy and shred-fanout. */
+tracepoint:syscalls:sys_enter_sendmmsg /pid == $1 && @last_recv/
+{
+	$d = nsecs - @last_recv;
+	@h_receive_to_send = hist($d);
+	@h_receive_to_send_stats = stats($d);
+}
+
+/* One of our threads is switched out while it still wanted to run
+ * (preempted, not sleeping): low 7 bits of prev_state are 0 for R / R+. */
+tracepoint:sched:sched_switch /pid == $1 && (args->prev_state & 0x7f) == 0/
+{
+	@preempted_at[args->prev_pid] = nsecs;
+	@taken_over_by[args->next_comm] = count();
+}
+
+/* ... and gets its CPU back. */
+tracepoint:sched:sched_switch /@preempted_at[args->next_pid]/
+{
+	$d = nsecs - @preempted_at[args->next_pid];
+	delete(@preempted_at[args->next_pid]);
+	if (strncmp(args->next_comm, "ssListen", 8) == 0 || strncmp(args->next_comm, "fanRecv", 7) == 0) {
+		@p_receiver = hist($d);
+		@p_receiver_stats = stats($d);
+	} else if (strncmp(args->next_comm, "ssPxyTx", 7) == 0) {
+		@p_coordinator = hist($d);
+		@p_coordinator_stats = stats($d);
+	} else if (strncmp(args->next_comm, "ssPxyDst", 8) == 0 || strncmp(args->next_comm, "fanSend", 7) == 0) {
+		@p_sender = hist($d);
+		@p_sender_stats = stats($d);
+	}
 }
 
 /* Any of our threads is being woken (by anyone: softirq, another thread). */
@@ -190,12 +228,19 @@ END
 {
 	clear(@rx); clear(@mine); clear(@wake); clear(@runq); clear(@recv_done); clear(@tx_run);
 	clear(@tx_last); clear(@tx_wakes); clear(@w_run); clear(@send_start);
-	clear(@oldest); clear(@elapsed);
+	clear(@oldest); clear(@elapsed); clear(@last_recv); clear(@preempted_at);
 
 	printf("\n===== SUMMARY (count, average ns) =====\n");
+	printf("-- any design --\n");
 	print(@packets_queued);
 	print(@s0_kernel_receive_stats);
 	print(@s1_socket_wait_stats);
+	print(@h_receive_to_send_stats);
+	print(@s8_sendmmsg_stats);
+	print(@p_receiver_stats);
+	print(@p_coordinator_stats);
+	print(@p_sender_stats);
+	printf("-- jito-shredstream-proxy only --\n");
 	print(@s2_receiver_wakeup_stats);
 	print(@s3_receive_to_coordinator_wake_stats);
 	print(@s4_coordinator_wakeup_stats);
@@ -203,7 +248,6 @@ END
 	print(@s5b_coordinator_wake_to_last_worker_wake_stats);
 	print(@s6_worker_wakeup_stats);
 	print(@s7_worker_wake_to_send_stats);
-	print(@s8_sendmmsg_stats);
 	print(@runq_receiver_stats);
 	print(@runq_coordinator_stats);
 	print(@runq_worker_stats);
@@ -236,6 +280,14 @@ END
 	print(@runq_receiver);
 	print(@runq_coordinator);
 	print(@runq_worker);
+	printf("\nH most recent receive -> each sendmmsg starts (approximate)\n");
+	print(@h_receive_to_send);
+	printf("\nPreempted: switched out while wanting to run -> back on CPU\n");
+	print(@p_receiver);
+	print(@p_coordinator);
+	print(@p_sender);
+	printf("\nWhat ran instead when our threads were preempted (count)\n");
+	print(@taken_over_by, 15);
 
 	clear(@packets_queued);
 	clear(@s0_kernel_receive); clear(@s0_kernel_receive_stats);
@@ -253,4 +305,9 @@ END
 	clear(@runq_receiver); clear(@runq_receiver_stats);
 	clear(@runq_coordinator); clear(@runq_coordinator_stats);
 	clear(@runq_worker); clear(@runq_worker_stats);
+	clear(@h_receive_to_send); clear(@h_receive_to_send_stats);
+	clear(@p_receiver); clear(@p_receiver_stats);
+	clear(@p_coordinator); clear(@p_coordinator_stats);
+	clear(@p_sender); clear(@p_sender_stats);
+	clear(@taken_over_by);
 }
