@@ -91,6 +91,7 @@ static int local_fd = -1;
 
 static struct {
 	uint64_t shreds, copies, tx_full, local_fail, no_meta;
+	uint64_t busy_ns;        /* time spent handling shreds (capacity use) */
 	uint32_t n;
 	uint64_t *first, *last;
 } st;
@@ -349,6 +350,7 @@ static void handle(uint8_t *pkt, uint32_t len)
 	const uint8_t *payload;
 	uint32_t plen;
 	int sent_any = 0;
+	uint64_t t_begin = now_ns();
 
 	if (m->magic == META_MAGIC) {
 		rx_ns = m->rx_ns;
@@ -406,6 +408,7 @@ static void handle(uint8_t *pkt, uint32_t len)
 		t = now_ns();
 	}
 	st.shreds++;
+	st.busy_ns += t - t_begin;
 	if (rx_ns && st.n < MAX_SAMPLES) {
 		st.first[st.n] = (sent_any ? t_first : t) - rx_ns;
 		st.last[st.n] = t - rx_ns;
@@ -451,11 +454,14 @@ static void report(double secs, const char *label, const char *results)
 	if (n) {
 		qsort(st.first, n, sizeof(uint64_t), cmp_u64);
 		qsort(st.last, n, sizeof(uint64_t), cmp_u64);
-		printf("[%s] %.0fs: %lu shreds, %lu copies, send ring full %lu, local send failed %lu | "
+		printf("[%s] %.0fs: %lu shreds, %lu copies, send ring full %lu, local send failed %lu, "
+		       "busy %.1f%% (%.2f us/shred) | "
 		       "all copies: p50 %.1f p90 %.1f p99 %.1f p99.9 %.1f max %.1f us | "
 		       "first copy: p50 %.1f p99 %.1f us\n",
 		       label, secs, (unsigned long)st.shreds, (unsigned long)st.copies, (unsigned long)st.tx_full,
-		       (unsigned long)st.local_fail, pct(st.last, n, .5), pct(st.last, n, .9), pct(st.last, n, .99),
+		       (unsigned long)st.local_fail, st.busy_ns / (secs * 1e7),
+		       st.shreds ? st.busy_ns / 1000.0 / st.shreds : 0, pct(st.last, n, .5), pct(st.last, n, .9),
+		       pct(st.last, n, .99),
 		       pct(st.last, n, .999), st.last[n - 1] / 1000.0, pct(st.first, n, .5), pct(st.first, n, .99));
 	} else {
 		printf("[%s] %.0fs: %lu shreds, no timed samples (no arrival metadata: %lu)\n", label, secs,
@@ -477,7 +483,7 @@ static void report(double secs, const char *label, const char *results)
 			fclose(f);
 		}
 	}
-	st.shreds = st.copies = st.tx_full = st.local_fail = st.no_meta = 0;
+	st.shreds = st.copies = st.tx_full = st.local_fail = st.no_meta = st.busy_ns = 0;
 	st.n = 0;
 }
 
