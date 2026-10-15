@@ -47,7 +47,8 @@ candidates are now tested on production traffic with alternating A/B runs.
    all three ports (5544, 23997, 23998), and all three forwarders send to the
    same 15 destinations, so the box does ~3× the necessary send work.
    23997 and 23998 each deliver first about half the time; 5544 is never
-   first (12 ms behind at p50) but is the only source for ~1% of shreds.
+   first (12 ms behind at p50), and ~40% of its traffic is re-sent old
+   shreds (4 s–1 min old).
 4. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
    shreds/s, so send capacity during bursts matters as much as per-shred
    speed.
@@ -70,6 +71,9 @@ candidates are now tested on production traffic with alternating A/B runs.
 - **`shred-fanout` threads being switched out:** they waited for a CPU only
   ~17 ms in 10 s.
 - **Queueing in the bond/VLAN devices:** both use `noqueue`.
+- **Lost shreds in the delivery dips:** every "missing" shred was a stale
+  re-send (4 s–1 min old) from the 5544 source, already forwarded live; no
+  live shred was missing. The probe now excludes stale re-sends.
 - **Batching delay in the receiver:** the proxy does not hold packets back.
 
 ## Open questions
@@ -84,9 +88,9 @@ candidates are now tested on production traffic with alternating A/B runs.
   in the lab)? Suspected: ~2.8 µs per copy through VLAN, bond and NIC
   driver, serially on one CPU per source, saturating in bursts. And what
   does it cost in kernel CPU?
-- Why did delivery dip to 57–94% for ~3 minutes during the 8-pair test (both
-  with and without the filter)? Suspected: a source re-sending older shreds,
-  which the forwarders correctly ignore but a 10 s probe counts as missing.
+- Should stale shreds (seconds old, re-sent by the 5544 source) be dropped
+  in the kernel? Saves ~20% of the fan-out work, unless consumers use late
+  shreds to fill gaps.
 - Which process still sends to the old dead IPs (`FAILED` in the neighbour
   table)?
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet

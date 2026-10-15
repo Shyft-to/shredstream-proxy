@@ -94,6 +94,13 @@ struct AnalyzeArgs {
     #[arg(long, default_value_t = 500)]
     edge_ms: u64,
 
+    /// Exclude stale re-sends: shreds whose slot, when they arrived, was
+    /// more than this many slots (~400 ms each) behind the newest slot seen
+    /// so far. Their live copies were forwarded before the capture, so they
+    /// would otherwise count as missing. 0 disables.
+    #[arg(long, default_value_t = 8)]
+    stale_slots: u64,
+
     /// Label recorded with the result (e.g. "baseline", "rx-usecs-0").
     #[arg(long, default_value = "unlabelled")]
     label: String,
@@ -257,6 +264,8 @@ struct Ingress {
     ports_seen: u32,
     /// Solana slot from the shred header (0 if the packet is too short).
     slot: u64,
+    /// How far its slot was behind the newest slot seen when it arrived.
+    slot_lag: u64,
 }
 
 /// Shred header: signature (64 bytes), variant (1), then the slot (u64 LE).
@@ -294,6 +303,8 @@ struct PortStats {
     incomplete_first_here: u64,
     /// Incomplete shreds that arrived on this port only.
     incomplete_only_here: u64,
+    /// Stale re-sends (excluded) that first arrived on this port.
+    stale: u64,
 }
 
 struct Egress {
@@ -376,6 +387,9 @@ struct AnalyzeResult {
     by_port: Vec<PortStats>,
     /// Incomplete shreds by how many slots behind the newest slot they were.
     incomplete_slot_lag: Vec<SlotLagBucket>,
+    /// Stale re-sends excluded from all of the above.
+    stale_shreds: u64,
+    stale_slots: u64,
     /// Latency grouped by how busy the forwarder was just before the shred
     /// arrived. Rising latency with load means queueing.
     by_recent_arrivals: Vec<LoadBucket>,
@@ -433,6 +447,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
                         first_port: port_i,
                         ports_seen: 1 << port_i,
                         slot: shred_slot(p.payload),
+                        slot_lag: 0,
                     });
                 continue;
             }
@@ -508,19 +523,31 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
             first: 0,
             incomplete_first_here: 0,
             incomplete_only_here: 0,
+            stale: 0,
         })
         .collect();
 
-    let newest_slot = ingress
-        .values()
-        .filter(|i| i.first_ns >= win_lo && i.first_ns <= win_hi)
-        .map(|i| i.slot)
-        .max()
-        .unwrap_or(0);
+    // Slot lag at arrival: compare each shred with the newest slot seen so far.
+    let mut by_time: Vec<(u64, u64)> = ingress.iter().map(|(k, i)| (i.first_ns, *k)).collect();
+    by_time.sort_unstable();
+    let mut newest = 0u64;
+    for (_, k) in &by_time {
+        let ing = ingress.get_mut(k).expect("key from the same map");
+        if ing.slot != 0 {
+            newest = newest.max(ing.slot);
+            ing.slot_lag = newest - ing.slot;
+        }
+    }
     let mut lag_counts = [0u64; SLOT_LAG_BUCKETS.len()];
+    let mut stale_shreds = 0u64;
 
     for (key, ing) in &ingress {
         if ing.first_ns < win_lo || ing.first_ns > win_hi {
+            continue;
+        }
+        if a.stale_slots > 0 && ing.slot_lag > a.stale_slots {
+            stale_shreds += 1;
+            by_port[ing.first_port].stale += 1;
             continue;
         }
         eligible += 1;
@@ -561,7 +588,7 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
             if ing.ports_seen.count_ones() == 1 {
                 by_port[ing.first_port].incomplete_only_here += 1;
             }
-            let lag = newest_slot.saturating_sub(ing.slot);
+            let lag = ing.slot_lag;
             let b = SLOT_LAG_BUCKETS
                 .iter()
                 .position(|&(max, _)| lag <= max)
@@ -651,6 +678,8 @@ fn analyze(a: AnalyzeArgs) -> Res<()> {
         load_window_us: a.load_window_us,
         by_port,
         incomplete_slot_lag,
+        stale_shreds,
+        stale_slots: a.stale_slots,
         by_recent_arrivals,
     };
 
@@ -734,6 +763,12 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
             r.negative_latencies
         );
     }
+    if r.stale_shreds > 0 {
+        println!(
+            "stale re-sends excluded: {} shreds arrived more than {} slots behind the newest slot (forwarded live before the capture)",
+            r.stale_shreds, r.stale_slots
+        );
+    }
     if r.missing_sends > 0 {
         println!("incomplete shreds by age (slots behind the newest; ~400 ms per slot)");
         for b in &r.incomplete_slot_lag {
@@ -743,13 +778,13 @@ fn print_report(r: &AnalyzeResult, show_dests: usize) {
     if r.by_port.len() > 1 {
         println!("per listen port (shreds in the window)");
         println!(
-            "  {:>6} {:>9} {:>9} {:>22} {:>22}",
-            "port", "arrived", "first", "incomplete, first here", "incomplete, only here"
+            "  {:>6} {:>9} {:>9} {:>22} {:>22} {:>8}",
+            "port", "arrived", "first", "incomplete, first here", "incomplete, only here", "stale"
         );
         for p in &r.by_port {
             println!(
-                "  {:>6} {:>9} {:>9} {:>22} {:>22}",
-                p.port, p.shreds, p.first, p.incomplete_first_here, p.incomplete_only_here
+                "  {:>6} {:>9} {:>9} {:>22} {:>22} {:>8}",
+                p.port, p.shreds, p.first, p.incomplete_first_here, p.incomplete_only_here, p.stale
             );
         }
     }
