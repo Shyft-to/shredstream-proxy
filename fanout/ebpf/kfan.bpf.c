@@ -10,6 +10,8 @@
  * Fail-open: with an empty destination table, or on an internal error, the
  * original passes up the stack untouched and the forwarders handle it.
  * Watched ports are fixed at build time: -DPORT_A=... [-DPORT_B ... -DPORT_D].
+ * Optional -DDROP_A=... [-DDROP_B=...]: UDP to these ports is dropped before
+ * anything else (e.g. to switch a source off without stopping its forwarder).
  */
 #include <stddef.h>
 #include <linux/bpf.h>
@@ -32,6 +34,12 @@
 #endif
 #ifndef PORT_D
 #define PORT_D 0
+#endif
+#ifndef DROP_A
+#define DROP_A 0
+#endif
+#ifndef DROP_B
+#define DROP_B 0
 #endif
 
 #define KEY_BYTES 88
@@ -80,6 +88,7 @@ enum {
 	STAT_NO_DESTS,   /* destination table empty: passed to the forwarders */
 	STAT_CLONED,     /* copies sent */
 	STAT_CLONE_FAIL, /* copies the kernel refused */
+	STAT_IGNORED,    /* UDP to a DROP_ port, dropped */
 	STAT_MAX,
 };
 
@@ -133,6 +142,10 @@ int kfan(struct __sk_buff *skb)
 	if (bpf_skb_load_bytes(skb, l4, &udp, sizeof(udp)))
 		return TC_ACT_OK;
 	port = bpf_ntohs(udp.dest);
+	if ((DROP_A && port == DROP_A) || (DROP_B && port == DROP_B)) {
+		count(STAT_IGNORED);
+		return TC_ACT_SHOT;
+	}
 	if (!watched(port))
 		return TC_ACT_OK;
 	if (bpf_skb_load_bytes(skb, l4 + sizeof(udp), &key, sizeof(key))) {

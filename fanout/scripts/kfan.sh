@@ -10,7 +10,8 @@
 #   kfan.sh cost [SECONDS]       measured kernel CPU time per packet (default 10 s)
 #
 # Shares tc priority 7700 with dedup.sh: only one of the two can be attached.
-# Settings (environment): DEV (bond0)
+# Settings (environment): DEV (bond0), DROP_PORTS (up to 2, comma separated:
+#   UDP to these ports is dropped, e.g. to switch a source off)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,6 +30,13 @@ build() {
         [[ "$p" =~ ^[0-9]+$ ]] || { echo "bad port: $p" >&2; exit 1; }
         [ $i -lt 4 ] || { echo "at most 4 ports" >&2; exit 1; }
         defs+=("-DPORT_${names[$i]}=$p")
+        i=$((i + 1))
+    done
+    i=0
+    for p in ${DROP_PORTS//,/ }; do
+        [[ "$p" =~ ^[0-9]+$ ]] || { echo "bad drop port: $p" >&2; exit 1; }
+        [ $i -lt 2 ] || { echo "at most 2 drop ports" >&2; exit 1; }
+        defs+=("-DDROP_${names[$i]}=$p")
         i=$((i + 1))
     done
     clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
@@ -84,7 +92,7 @@ attach() {
     build "$1"
     tc qdisc show dev "$DEV" | grep -q clsact || tc qdisc add dev "$DEV" clsact
     tc filter add dev "$DEV" ingress pref "$PREF" handle 1 bpf direct-action obj "$OBJ" sec tc
-    echo "attached on $DEV ingress for ports $1 (passing everything until destinations load)"
+    echo "attached on $DEV ingress for ports $1${DROP_PORTS:+, dropping $DROP_PORTS} (passing everything until destinations load)"
     if ! load_dests "$2"; then
         echo "destination load failed; detaching" >&2
         detach
@@ -110,7 +118,7 @@ counters() {
     bpftool -j map dump name kfan_stats 2>/dev/null | python3 -c '
 import json, sys
 names = ["first copies", "duplicates (dropped)", "too short (passed)", "dedup error (passed)",
-         "no destinations (passed)", "copies sent", "copies refused"]
+         "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:
