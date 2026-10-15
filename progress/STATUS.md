@@ -18,11 +18,11 @@ implementation is measured the same way
 | Where | Date | Runs | p50 | p90 | p99 | CPU per send |
 |---|---|---|---|---|---|---|
 | Production, port 23998 (15 destinations) | 2026-10-14 | 2 | 245 µs | 813 µs | 3.3 ms | 11.4 µs |
-| Lab, 4 cores — _not representative yet_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
+| Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 The production row rests on 2 runs; other runs put p99 between 1.2 and
-3.5 ms. The lab is ~5× slower than production, likely because the forwarder
-only gets 4 cores there; it is being calibrated before use.
+3.5 ms. The lab is ~5× slower than production (likely too few cores), so
+candidates are now tested on production traffic with alternating A/B runs.
 
 ## Key findings
 
@@ -60,8 +60,9 @@ only gets 4 cores there; it is being calibrated before use.
 
 ## Next
 
-1. Calibrate the lab so its baseline matches production (more cores).
-2. Measure the existing busy-spin build (`opt_1_1`) against the baseline.
+1. A/A test on production (baseline vs itself) to validate the A/B method
+   and its noise level.
+2. A/B test the existing busy-spin build (`opt_1_1`) on production.
 3. Prototype an eBPF fan-out (no thread hand-offs, cheaper per copy).
 
 ## Log
@@ -69,3 +70,4 @@ only gets 4 cores there; it is being calibrated before use.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B) |
