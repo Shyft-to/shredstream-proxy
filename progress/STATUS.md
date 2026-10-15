@@ -22,7 +22,7 @@ implementation is measured the same way
 | **Box level**, 3 forwarders, kernel dedup **off** | 2026-10-15 | 8 | 321 µs | — | 5.4 ms (median) | ~8.0 cores in total |
 | **Box level**, 3 forwarders, kernel dedup **on** | 2026-10-15 | 8 | **185 µs** | — | **2.4 ms** (median) | **~1.6 cores** in total |
 | **Box level, kernel fan-out** (no userspace forwarding) | 2026-10-15 | 6 | **89 µs** | — | **0.31 ms** (median) | **~0.23 cores** (kernel) |
-| **Box level, kernel fan-out, direct to NIC ports** (measured at the ports) | 2026-10-15 | 6 | **82 µs** | — | **0.26 ms** (median) | kernel only |
+| **Box level, kernel fan-out, direct to NIC ports** (measured at the ports) | 2026-10-15 | 10 × 60 s | **86 µs** | — | **0.27 ms** (median) | kernel only |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 Box level (since 2026-10-15) is the north star: first arrival on any of the

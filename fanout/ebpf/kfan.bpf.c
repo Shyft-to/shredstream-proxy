@@ -43,7 +43,7 @@
 #endif
 
 #define KEY_BYTES 88
-#define SEEN_ENTRIES 262144
+#define SEEN_ENTRIES 1048576
 #define MAX_DESTS 32
 #define EEXIST 17
 

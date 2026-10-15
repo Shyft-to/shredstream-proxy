@@ -36,9 +36,10 @@
  * fec_set_index (83 bytes), plus the next 5 header bytes. Identical in every
  * source's copy, distinct between shreds. */
 #define KEY_BYTES 88
-/* Recently seen shreds; at ~7-10k unique shreds/s this covers ~30 s, far
- * longer than the gap between copies of the same shred (tens of ms). */
-#define SEEN_ENTRIES 262144
+/* Recently seen shreds: ~2 min at ~8-9k first copies/s. Long enough to
+ * also catch sources that re-send shreds tens of seconds late (5544 does),
+ * so those are not fanned out a second time. ~150 MB of kernel memory. */
+#define SEEN_ENTRIES 1048576
 #define EEXIST 17
 
 struct shred_key {
