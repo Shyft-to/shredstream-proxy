@@ -12,6 +12,14 @@
  * Watched ports are fixed at build time: -DPORT_A=... [-DPORT_B ... -DPORT_D].
  * Optional -DDROP_A=... [-DDROP_B=...]: UDP to these ports is dropped before
  * anything else (e.g. to switch a source off without stopping its forwarder).
+ *
+ * Multi-CPU fan-out (-DGROUPS=n, n > 1): destinations are split into n
+ * groups. Group 0 is sent inline on the CPU that received the shred. For each
+ * other group a "carrier" copy of the untouched packet is re-injected into
+ * this device's receive path, marked with its group number and given a hash
+ * that receive packet steering (RPS on rx queue 0, set up by kfan.sh) maps to
+ * that group's own CPU. There this same program sees the mark and sends that
+ * group's copies, so the groups go out in parallel.
  */
 #include <stddef.h>
 #include <linux/bpf.h>
@@ -42,9 +50,17 @@
 #define DROP_B 0
 #endif
 
+#ifndef GROUPS
+#define GROUPS 1
+#endif
+#define MAX_GROUPS 4
+#define MAX_PER_GROUP 16
+#define CARRIER_MARK 0x6b660000 /* "kf" << 16 | group */
+#define CARRIER_MASK 0xffff0000
+
 #define KEY_BYTES 88
 #define SEEN_ENTRIES 1048576
-#define MAX_DESTS 32
+#define MAX_DESTS (MAX_GROUPS * MAX_PER_GROUP) /* group g: entries g*16 .. g*16+15 */
 #define EEXIST 17
 
 #define IP_CSUM_OFF (ETH_HLEN + offsetof(struct iphdr, check))
@@ -89,6 +105,8 @@ enum {
 	STAT_CLONED,     /* copies sent */
 	STAT_CLONE_FAIL, /* copies the kernel refused */
 	STAT_IGNORED,    /* UDP to a DROP_ port, dropped */
+	STAT_CARRIED,    /* carrier copies handed to another CPU */
+	STAT_CARRY_FAIL, /* carrier copies the kernel refused */
 	STAT_MAX,
 };
 
@@ -113,75 +131,17 @@ static __always_inline int watched(__u16 port)
 	       (PORT_C && port == PORT_C) || (PORT_D && port == PORT_D);
 }
 
-SEC("tc")
-int kfan(struct __sk_buff *skb)
+/* Sends the shred to every destination of group g. Rewrites headers in place
+ * (UDP source port and checksum are set by the caller). */
+static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
+				       __be32 cur_saddr, __be32 cur_daddr)
 {
-	struct iphdr ip;
-	struct udphdr udp;
-	struct shred_key key;
 	struct dest *d;
-	__u8 first_byte;
-	__u32 ihl, l4, i, zero = 0;
-	__be32 cur_saddr, cur_daddr;
-	__be16 sport;
-	__u16 cur_vlan;
-	__u16 port, no_csum = 0;
-	long ret;
+	__u16 cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
+	__u32 i;
 
-	if (skb->protocol != bpf_htons(ETH_P_IP))
-		return TC_ACT_OK;
-	if (bpf_skb_load_bytes(skb, ETH_HLEN, &first_byte, 1))
-		return TC_ACT_OK;
-	ihl = (first_byte & 0x0f) * 4;
-	if (ihl < sizeof(ip) || ihl > 60)
-		return TC_ACT_OK;
-	if (bpf_skb_load_bytes(skb, ETH_HLEN, &ip, sizeof(ip)))
-		return TC_ACT_OK;
-	if (ip.protocol != IPPROTO_UDP || (ip.frag_off & bpf_htons(0x3fff)))
-		return TC_ACT_OK;
-	l4 = ETH_HLEN + ihl;
-	if (bpf_skb_load_bytes(skb, l4, &udp, sizeof(udp)))
-		return TC_ACT_OK;
-	port = bpf_ntohs(udp.dest);
-	if ((DROP_A && port == DROP_A) || (DROP_B && port == DROP_B)) {
-		count(STAT_IGNORED);
-		return TC_ACT_SHOT;
-	}
-	if (!watched(port))
-		return TC_ACT_OK;
-	if (bpf_skb_load_bytes(skb, l4 + sizeof(udp), &key, sizeof(key))) {
-		count(STAT_SHORT);
-		return TC_ACT_OK;
-	}
-
-	ret = bpf_map_update_elem(&kfan_seen, &key, &port, BPF_NOEXIST);
-	if (ret == -EEXIST) {
-		count(STAT_DUPLICATE);
-		return TC_ACT_SHOT;
-	}
-	if (ret) {
-		count(STAT_ERROR);
-		return TC_ACT_OK;
-	}
-	count(STAT_FIRST);
-
-	d = bpf_map_lookup_elem(&kfan_dests, &zero);
-	if (!d || !d->ifindex) {
-		count(STAT_NO_DESTS);
-		return TC_ACT_OK;
-	}
-
-	/* Same for every copy: sent from the port the shred arrived on, and
-	 * without a UDP checksum (0 = none, valid for IPv4). */
-	sport = udp.dest;
-	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, source), &sport, sizeof(sport), 0);
-	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, check), &no_csum, sizeof(no_csum), 0);
-	cur_saddr = ip.saddr;
-	cur_daddr = ip.daddr;
-	cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
-
-	for (i = 0; i < MAX_DESTS; i++) {
-		__u32 k = i;
+	for (i = 0; i < MAX_PER_GROUP; i++) {
+		__u32 k = g * MAX_PER_GROUP + i;
 
 		d = bpf_map_lookup_elem(&kfan_dests, &k);
 		if (!d || !d->ifindex)
@@ -212,6 +172,99 @@ int kfan(struct __sk_buff *skb)
 		else
 			count(STAT_CLONED);
 	}
+}
+
+SEC("tc")
+int kfan(struct __sk_buff *skb)
+{
+	struct iphdr ip;
+	struct udphdr udp;
+	struct shred_key key;
+	struct dest *d;
+	__u8 first_byte;
+	__u32 ihl, l4, g = 0, zero = 0;
+	__be16 sport;
+	__u16 port, no_csum = 0;
+	long ret;
+
+	if (skb->protocol != bpf_htons(ETH_P_IP))
+		return TC_ACT_OK;
+	if (bpf_skb_load_bytes(skb, ETH_HLEN, &first_byte, 1))
+		return TC_ACT_OK;
+	ihl = (first_byte & 0x0f) * 4;
+	if (ihl < sizeof(ip) || ihl > 60)
+		return TC_ACT_OK;
+	if (bpf_skb_load_bytes(skb, ETH_HLEN, &ip, sizeof(ip)))
+		return TC_ACT_OK;
+	if (ip.protocol != IPPROTO_UDP || (ip.frag_off & bpf_htons(0x3fff)))
+		return TC_ACT_OK;
+	l4 = ETH_HLEN + ihl;
+	if (bpf_skb_load_bytes(skb, l4, &udp, sizeof(udp)))
+		return TC_ACT_OK;
+	port = bpf_ntohs(udp.dest);
+	if ((DROP_A && port == DROP_A) || (DROP_B && port == DROP_B)) {
+		count(STAT_IGNORED);
+		return TC_ACT_SHOT;
+	}
+	if (!watched(port))
+		return TC_ACT_OK;
+
+	if ((skb->mark & CARRIER_MASK) == CARRIER_MARK) {
+		/* A carrier we sent ourselves, now on its group's CPU. */
+		g = skb->mark & 0xffff;
+		if (g >= MAX_GROUPS)
+			return TC_ACT_SHOT;
+	} else {
+		if (bpf_skb_load_bytes(skb, l4 + sizeof(udp), &key, sizeof(key))) {
+			count(STAT_SHORT);
+			return TC_ACT_OK;
+		}
+		ret = bpf_map_update_elem(&kfan_seen, &key, &port, BPF_NOEXIST);
+		if (ret == -EEXIST) {
+			count(STAT_DUPLICATE);
+			return TC_ACT_SHOT;
+		}
+		if (ret) {
+			count(STAT_ERROR);
+			return TC_ACT_OK;
+		}
+		count(STAT_FIRST);
+
+		d = bpf_map_lookup_elem(&kfan_dests, &zero);
+		if (!d || !d->ifindex) {
+			count(STAT_NO_DESTS);
+			return TC_ACT_OK;
+		}
+
+#if GROUPS > 1
+		/* Hand groups 1.. to their CPUs first, before any header rewrite:
+		 * carriers share the untouched packet data. RPS on rx queue 0 picks
+		 * cpus[(hash * n) >> 32] among its n CPUs, so hash idx * 2^32 / n
+		 * lands on CPU number idx. */
+		skb->queue_mapping = 0;
+		for (__u32 c = 1; c < GROUPS && c < MAX_GROUPS; c++) {
+			__u32 k = c * MAX_PER_GROUP;
+
+			d = bpf_map_lookup_elem(&kfan_dests, &k);
+			if (!d || !d->ifindex)
+				continue;
+			skb->mark = CARRIER_MARK | c;
+			bpf_set_hash(skb, (__u32)((((__u64)(c - 1)) << 32) / (GROUPS - 1)) + 1);
+			if (bpf_clone_redirect(skb, skb->ifindex, BPF_F_INGRESS))
+				count(STAT_CARRY_FAIL);
+			else
+				count(STAT_CARRIED);
+		}
+		skb->mark = 0;
+#endif
+	}
+
+	/* Same for every copy: sent from the port the shred arrived on, and
+	 * without a UDP checksum (0 = none, valid for IPv4). */
+	sport = udp.dest;
+	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, source), &sport, sizeof(sport), 0);
+	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, check), &no_csum, sizeof(no_csum), 0);
+	send_group(skb, g, l4, ip.saddr, ip.daddr);
 	return TC_ACT_SHOT;
 }
 

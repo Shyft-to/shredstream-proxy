@@ -15,7 +15,11 @@
 # Settings (environment): DEV (bond0), DROP_PORTS (up to 2, comma separated:
 #   UDP to these ports is dropped, e.g. to switch a source off), DIRECT=1
 #   (send straight to the physical NIC ports: skips the VLAN and bond layers;
-#   the NIC adds the VLAN tag; destinations are spread over the bond's ports)
+#   the NIC adds the VLAN tag; destinations are spread over the bond's ports),
+#   KFAN_GROUPS=n (1..4, default 1) with KFAN_CPUS=c1,c2,.. (n-1 CPUs): multi-CPU
+#   fan-out. Destinations are split into n groups; group 0 is sent on the
+#   receiving CPU, group i on CPU ci (receive packet steering on DEV rx-0).
+#   Also raises net.core.netdev_max_backlog to >= 10000. Detach restores both.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,8 +28,11 @@ OBJ=/run/fanout-kfan.bpf.o
 DEV=${DEV:-bond0}
 DROP_PORTS=${DROP_PORTS:-}
 DIRECT=${DIRECT:-0}
+KFAN_GROUPS=${KFAN_GROUPS:-1}
+KFAN_CPUS=${KFAN_CPUS:-}
 PREF=7700
-MAX_DESTS=32
+PER_GROUP=16
+STATE=/run/fanout-kfan.state
 
 attached() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -q "pref $PREF "; }
 ours() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -A1 "pref $PREF " | grep -q kfan; }
@@ -45,6 +52,7 @@ build() {
         defs+=("-DDROP_${names[$i]}=$p")
         i=$((i + 1))
     done
+    defs+=("-DGROUPS=$KFAN_GROUPS")
     clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
         "${defs[@]}" -c "$SRC" -o "$OBJ"
 }
@@ -108,25 +116,69 @@ resolve() {
     echo "  $1 -> dev $out$([ "$out" != "$dev" ] && echo " (for $dev$([ "$vlan" != 0 ] && echo ", VLAN $vlan"))"), next hop $nh ($mac), from $src" >&2
 }
 
-# Resolves everything first (grouped by VLAN tag, so the program changes the
-# tag at most once per shred), then writes entries 1..n-1, terminator n, and
-# entry 0 last: until entry 0 is set the program passes all traffic on.
+# Resolves everything first. Destination j goes to group j % KFAN_GROUPS; within a
+# group, entries are ordered by VLAN tag (the program changes the tag at most
+# once per group). Writes every group's entries and terminator, and entry 0 of
+# group 0 last: until it is set the program passes all traffic on.
 load_dests() {
-    local dests=() lines=() entries=() d i=0 line
+    local dests=() groups=() entries=() d j=0 g i n line first=""
     IFS=, read -ra dests <<<"$1"
-    [ ${#dests[@]} -ge 1 ] && [ ${#dests[@]} -lt $MAX_DESTS ] || { echo "need 1..$((MAX_DESTS - 1)) destinations" >&2; return 1; }
+    [ ${#dests[@]} -ge 1 ] || { echo "no destinations" >&2; return 1; }
+    for ((g = 0; g < KFAN_GROUPS; g++)); do groups[g]=""; done
     for d in "${dests[@]}"; do
-        line=$(resolve "$d" "$i") || return 1
-        lines+=("$line")
-        i=$((i + 1))
+        line=$(resolve "$d" "$j") || return 1
+        g=$((j % KFAN_GROUPS))
+        groups[g]+="$line"$'\n'
+        j=$((j + 1))
     done
-    mapfile -t entries < <(printf '%s\n' "${lines[@]}" | sort -s -n -k1,1 | cut -d' ' -f2-)
-    for ((i = 1; i < ${#entries[@]}; i++)); do
-        bpftool map update name kfan_dests key hex $(hex_le32 $i) value hex ${entries[$i]}
+    for ((g = KFAN_GROUPS - 1; g >= 0; g--)); do
+        mapfile -t entries < <(printf '%s' "${groups[$g]}" | sort -s -n -k1,1 | cut -d' ' -f2-)
+        n=${#entries[@]}
+        [ "$n" -le $PER_GROUP ] || { echo "group $g has $n destinations, max $PER_GROUP" >&2; return 1; }
+        for ((i = (g == 0 ? 1 : 0); i < n; i++)); do
+            bpftool map update name kfan_dests key hex $(hex_le32 $((g * PER_GROUP + i))) value hex ${entries[$i]}
+        done
+        if [ "$n" -lt $PER_GROUP ]; then
+            bpftool map update name kfan_dests key hex $(hex_le32 $((g * PER_GROUP + n))) value hex $(printf '00 %.0s' $(seq 28))
+        fi
+        if [ "$g" -eq 0 ]; then first=${entries[0]}; fi
     done
-    bpftool map update name kfan_dests key hex $(hex_le32 ${#entries[@]}) value hex $(printf '00 %.0s' $(seq 28))
-    bpftool map update name kfan_dests key hex $(hex_le32 0) value hex ${entries[0]}
-    echo "loaded ${#entries[@]} destinations$(if [ "$DIRECT" = 1 ]; then echo " (direct to NIC ports)"; fi)"
+    bpftool map update name kfan_dests key hex $(hex_le32 0) value hex $first
+    echo "loaded ${#dests[@]} destinations in $KFAN_GROUPS group(s)$(if [ "$DIRECT" = 1 ]; then echo ", direct to NIC ports"; fi)"
+}
+
+# Multi-CPU fan-out: steer DEV rx queue 0 (only our re-injected carriers use
+# it) to KFAN_CPUS, and make sure each CPU's hand-off queue is large enough.
+# Saves the previous values for detach.
+steer_on() {
+    local mask_file="/sys/class/net/$DEV/queues/rx-0/rps_cpus" mask
+    [ -e "$mask_file" ] || { echo "$mask_file missing (RPS not available?)" >&2; return 1; }
+    mask=$(python3 -c '
+import sys
+m = 0
+for c in sys.argv[1].split(","):
+    m |= 1 << int(c)
+h = format(m, "x")
+h = h.zfill((len(h) + 7) // 8 * 8)
+print(",".join(h[i:i + 8] for i in range(0, len(h), 8)))' "$KFAN_CPUS")
+    # Keep the original values if a previous run left its state behind.
+    [ -e "$STATE" ] || printf 'rps=%s\nbacklog=%s\n' "$(cat "$mask_file")" "$(sysctl -n net.core.netdev_max_backlog)" >"$STATE"
+    echo "$mask" >"$mask_file"
+    if [ "$(sysctl -n net.core.netdev_max_backlog)" -lt 10000 ]; then
+        sysctl -qw net.core.netdev_max_backlog=10000
+    fi
+    echo "groups 1..$((KFAN_GROUPS - 1)) on CPUs $KFAN_CPUS (rps mask $mask on $DEV rx-0); netdev_max_backlog $(sysctl -n net.core.netdev_max_backlog)"
+}
+
+steer_off() {
+    [ -e "$STATE" ] || return 0
+    local rps backlog
+    rps=$(grep '^rps=' "$STATE" | cut -d= -f2)
+    backlog=$(grep '^backlog=' "$STATE" | cut -d= -f2)
+    echo "${rps:-0}" >"/sys/class/net/$DEV/queues/rx-0/rps_cpus" || true
+    if [ -n "$backlog" ]; then sysctl -qw net.core.netdev_max_backlog="$backlog" || true; fi
+    rm -f "$STATE"
+    echo "restored rps on $DEV rx-0 and netdev_max_backlog"
 }
 
 # Reloads the table whenever the set of active bond ports changes, and
@@ -150,10 +202,20 @@ watch_ports() {
 attach() {
     [ $# -eq 2 ] || { echo "usage: kfan.sh attach PORTS DESTS" >&2; exit 1; }
     attached && { echo "a filter is already attached on $DEV (pref $PREF); detach it first" >&2; exit 1; }
+    [[ "$KFAN_GROUPS" =~ ^[1-4]$ ]] || { echo "KFAN_GROUPS must be 1..4" >&2; exit 1; }
+    if [ "$KFAN_GROUPS" -gt 1 ] && [ "$(tr ',' '\n' <<<"$KFAN_CPUS" | grep -c .)" -ne $((KFAN_GROUPS - 1)) ]; then
+        echo "KFAN_CPUS must list exactly $((KFAN_GROUPS - 1)) CPUs for KFAN_GROUPS=$KFAN_GROUPS" >&2
+        exit 1
+    fi
     build "$1"
     tc qdisc show dev "$DEV" | grep -q clsact || tc qdisc add dev "$DEV" clsact
     tc filter add dev "$DEV" ingress pref "$PREF" handle 1 bpf direct-action obj "$OBJ" sec tc
     echo "attached on $DEV ingress for ports $1${DROP_PORTS:+, dropping $DROP_PORTS} (passing everything until destinations load)"
+    if [ "$KFAN_GROUPS" -gt 1 ] && ! steer_on; then
+        echo "CPU steering failed; detaching" >&2
+        detach
+        exit 1
+    fi
     if ! load_dests "$2"; then
         echo "destination load failed; detaching" >&2
         detach
@@ -173,24 +235,32 @@ detach() {
     else
         echo "not attached"
     fi
+    steer_off
 }
 
 counters() {
     bpftool -j map dump name kfan_stats 2>/dev/null | python3 -c '
 import json, sys
 names = ["first copies", "duplicates (dropped)", "too short (passed)", "dedup error (passed)",
-         "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)"]
+         "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)",
+         "carriers to other CPUs", "carriers refused"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:
     rows = json.load(sys.stdin)
 except ValueError:
     sys.exit("no counters (not attached?)")
+per_cpu = {}
 for r in rows:
     r = r.get("formatted", r)
     total = sum(num(v["value"]) for v in r["values"])
-    name = names[num(r["key"])]
-    print(f"  {name:<26} {total}")
+    key = num(r["key"])
+    print(f"  {names[key]:<26} {total}")
+    if names[key] == "copies sent":
+        per_cpu = {v["cpu"]: num(v["value"]) for v in r["values"] if num(v["value"])}
+if per_cpu:
+    busiest = sorted(per_cpu.items(), key=lambda kv: -kv[1])[:8]
+    print("  copies sent by CPU:       " + ", ".join(f"{c}:{n}" for c, n in busiest))
 '
 }
 
@@ -232,5 +302,5 @@ case "${1:-}" in
     status) status ;;
     cost) shift; cost "$@" ;;
     watch) shift; watch_ports "$@" ;;
-    *) sed -n '2,20p' "$0"; exit 1 ;;
+    *) sed -n '2,25p' "$0"; exit 1 ;;
 esac

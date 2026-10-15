@@ -25,6 +25,13 @@ cpu_ms() {
     awk -v hz="$(getconf CLK_TCK)" '{ sub(/^.*\) /, ""); print int(($12 + $13) * 1000 / hz) }' "/proc/$1/stat"
 }
 
+# Packets the kernel dropped because a CPU's input queue was full (all CPUs).
+backlog_drops() {
+    local s=0 a b rest
+    while read -r a b rest; do s=$((s + 0x$b)); done </proc/net/softnet_stat
+    echo "$s"
+}
+
 nstat_line() {
     nstat -z 2>/dev/null | awk '/UdpRcvbufErrors|UdpSndbufErrors|UdpInErrors/ { printf "%s=%s ", $1, $2 }'
 }
@@ -175,8 +182,9 @@ box() {
     # One process may own several ports; count each process once.
     cpu_sum() { local s=0 x; for x in $(printf '%s\n' "${pids[@]}" | sort -u); do s=$((s + $(cpu_ms "$x"))); done; echo "$s"; }
     nstat -n
-    local c0 c1 drops
+    local c0 c1 drops q0 q1
     c0=$(cpu_sum)
+    q0=$(backlog_drops)
     for i in "${ifaces[@]}"; do
         pcaps+=("$CAP_DIR/box-$stamp-$i.pcap")
         logs+=("$CAP_DIR/box-$stamp-$i.log")
@@ -185,6 +193,7 @@ box() {
     done
     wait "${tpids[@]}" || true
     c1=$(cpu_sum)
+    q1=$(backlog_drops)
     drops=$(nstat_line)
 
     local dropped=0 d log pcap_args=()
@@ -194,9 +203,11 @@ box() {
     done
     [ "$dropped" = "0" ] || echo "WARNING: tcpdump dropped packets ($dropped); treat this result with caution" >&2
     echo "kernel UDP errors during capture: ${drops:-none}"
+    echo "hand-off queue drops during capture: $((q1 - q0))"
     for i in "${pcaps[@]}"; do pcap_args+=(--pcap "$i"); done
 
-    "$BIN/fanout-measure" analyze "${pcap_args[@]}" --listen-port "$ports"         --dests "$all_dests" --egress-src-ports "$src_ports" --label "$label"         --results "$OUT/box-results.jsonl" --cpu-ms "$((c1 - c0))"         --meta "source=box" --meta "ports=$ports" --meta "tcpdump_dropped=$dropped"         --meta "capture=${ifaces[*]}" --meta "kernel_udp_errors=${drops:-none}" |
+    "$BIN/fanout-measure" analyze "${pcap_args[@]}" --listen-port "$ports"         --dests "$all_dests" --egress-src-ports "$src_ports" --label "$label"         --results "$OUT/box-results.jsonl" --cpu-ms "$((c1 - c0))"         --meta "source=box" --meta "ports=$ports" --meta "tcpdump_dropped=$dropped"         --meta "capture=${ifaces[*]}" --meta "kernel_udp_errors=${drops:-none}" \
+        --meta "backlog_drops=$((q1 - q0))" |
         tee "$OUT/$label-$stamp.txt"
 
     # Keep the evidence when something went missing.
