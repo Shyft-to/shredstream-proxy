@@ -97,8 +97,9 @@ struct AnalyzeArgs {
     /// Exclude stale re-sends: shreds whose slot, when they arrived, was
     /// more than this many slots (~400 ms each) behind the newest slot seen
     /// so far. Their live copies were forwarded before the capture, so they
-    /// would otherwise count as missing. 0 disables.
-    #[arg(long, default_value_t = 8)]
+    /// would otherwise count as missing. Live shreds are at most 1 slot
+    /// behind; 5544's re-sends start at ~2 slots (~1 s). 0 disables.
+    #[arg(long, default_value_t = 2)]
     stale_slots: u64,
 
     /// Label recorded with the result (e.g. "baseline", "rx-usecs-0").
