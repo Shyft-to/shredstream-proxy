@@ -21,7 +21,7 @@ implementation is measured the same way
 | Production, port 23998, A/B baseline side | 2026-10-15 | 6 | 195 µs | — | 2.0 ms (median) | 12.2 µs |
 | **Box level**, 3 forwarders, kernel dedup **off** | 2026-10-15 | 8 | 321 µs | — | 5.4 ms (median) | ~8.0 cores in total |
 | **Box level**, 3 forwarders, kernel dedup **on** | 2026-10-15 | 8 | **185 µs** | — | **2.4 ms** (median) | **~1.6 cores** in total |
-| **Box level, kernel fan-out** (no userspace forwarding) | 2026-10-15 | 6 | **89 µs** | — | **0.31 ms** (median) | kernel only (to be measured) |
+| **Box level, kernel fan-out** (no userspace forwarding) | 2026-10-15 | 6 | **89 µs** | — | **0.31 ms** (median) | **~0.23 cores** (kernel) |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 Box level (since 2026-10-15) is the north star: first arrival on any of the
@@ -86,10 +86,10 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- What limits the kernel fan-out now (~90 µs p50, ~300 µs p99, vs ~20 µs
-  in the lab)? Suspected: ~2.8 µs per copy through VLAN, bond and NIC
-  driver, serially on one CPU per source, saturating in bursts. And what
-  does it cost in kernel CPU?
+- Can the kernel fan-out be spread over several CPUs? It costs only ~0.23
+  cores in total (~1.9 µs per copy), but a burst's copies all land on the
+  one CPU receiving that source, which saturates (p50 ~90 µs, p99
+  ~300 µs).
 - Which process still sends to the old dead IPs (`FAILED` in the neighbour
   table)?
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
