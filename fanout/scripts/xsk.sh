@@ -32,7 +32,8 @@ export LIBXDP_BPFFS=${LIBXDP_BPFFS:-$(dirname "${PIN:-/sys/fs/bpf/xskfwd}")}
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 XSK_DIR="$(cd "$DIR/../xsk" && pwd)"
-BUILD=/run/fanout-xsk
+# Not /run: it is mounted noexec on Ubuntu, so the forwarder could not start.
+BUILD="$(cd "$DIR/../.." && pwd)/target/xsk"
 OBJ=$BUILD/xsk_kern.bpf.o
 FWD=$BUILD/xskfwd
 PIN=${PIN:-/sys/fs/bpf/xskfwd}
