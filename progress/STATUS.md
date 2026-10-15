@@ -21,6 +21,7 @@ implementation is measured the same way
 | Production, port 23998, A/B baseline side | 2026-10-15 | 6 | 195 µs | — | 2.0 ms (median) | 12.2 µs |
 | **Box level**, 3 forwarders, kernel dedup **off** | 2026-10-15 | 8 | 321 µs | — | 5.4 ms (median) | ~8.0 cores in total |
 | **Box level**, 3 forwarders, kernel dedup **on** | 2026-10-15 | 8 | **185 µs** | — | **2.4 ms** (median) | **~1.6 cores** in total |
+| **Box level, kernel fan-out** (no userspace forwarding) | 2026-10-15 | 6 | **89 µs** | — | **0.31 ms** (median) | kernel only (to be measured) |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 Box level (since 2026-10-15) is the north star: first arrival on any of the
@@ -32,27 +33,32 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 ## Key findings
 
-1. **Kernel dedup across the three sources works.** Dropping later copies of
+1. **Kernel fan-out cuts the tail 7.5×.** One eBPF program on `bond0`
+   receive drops duplicate copies and clones each shred directly to all 15
+   destinations. Against kernel dedup + 3 proxies (6 vs 6): p99 2.35 →
+   0.31 ms (−87%, very stable), p50 137 → 89 µs (−35%), first destination
+   −17%. Since the start: p99 6.2 → 0.31 ms.
+2. **Kernel dedup across the three sources works.** Dropping later copies of
    each shred in an eBPF filter (forwarders unchanged), 8 vs 8 runs: p99
    −55% (5.45 → 2.43 ms), p50 −42% (321 → 185 µs), first destination −36%,
    forwarder CPU −80% (~8 → ~1.6 cores). All proven; delivery unaffected.
    Filter cost: 625 ns of kernel CPU per packet (~2.6% of one core).
-2. **The three sources deliver the same shreds.** 98.8% of shreds arrive on
+3. **The three sources deliver the same shreds.** 98.8% of shreds arrive on
    all three ports (5544, 23997, 23998), and all three forwarders send to the
    same 15 destinations, so the box does ~3× the necessary send work.
    23997 and 23998 each deliver first about half the time; 5544 is never
    first (12 ms behind at p50) but is the only source for ~1% of shreds.
-3. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
+4. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
    shreds/s, so send capacity during bursts matters as much as per-shred
    speed.
-4. **Most of the tail is queueing.** When little traffic arrived just before
+5. **Most of the tail is queueing.** When little traffic arrived just before
    a shred, the forwarder delivers it everywhere in ~70 µs (p50). Under normal
    load (86% of shreds) the same shred takes ~4.5× longer at p50 and 5–8× at
    p99, because it waits behind earlier shreds.
-5. **The biggest single cost is the coordinator waking the ~15 destination
+6. **The biggest single cost is the coordinator waking the ~15 destination
    worker threads one after another:** 65–130 µs per shred. Each extra thread
    hand-off costs ~10–13 µs, and each send ~4–8 µs.
-6. **Dead destinations are expensive.** Removing one local destination with
+7. **Dead destinations are expensive.** Removing one local destination with
    no listener halved p99 (6.2 → 3.1 ms) and sped up every other destination.
 
 ## Ruled out
@@ -74,10 +80,10 @@ candidates are now tested on production traffic with alternating A/B runs.
   cores). Options: kernel tuning (conntrack, IOMMU) or bypassing the UDP/IP
   stack (`AF_PACKET`, eBPF). The CPU profile shows the per-copy cost
   spread across many kernel layers; tuning alone likely saves only 10–20%.
-- Can the kernel itself fan out faster than three proxies + kernel dedup?
-  In userspace, one `shred-fanout` (8 senders) made the typical shred much
-  faster (p50 −58%, first destination −85%) but left p99 unchanged, at ~9
-  cores.
+- What limits the kernel fan-out now (~90 µs p50, ~300 µs p99, vs ~20 µs
+  in the lab)? Suspected: ~2.8 µs per copy through VLAN, bond and NIC
+  driver, serially on one CPU per source, saturating in bursts. And what
+  does it cost in kernel CPU?
 - Why did delivery dip to 57–94% for ~3 minutes during the 8-pair test (both
   with and without the filter)? Suspected: a source re-sending older shreds,
   which the forwarders correctly ignore but a 10 s probe counts as missing.
@@ -99,7 +105,9 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. Deploy kernel dedup permanently (systemd service, instant rollback).
+2. Confirm delivery (slot-age breakdown) and measure the kernel fan-out's
+   CPU cost; then decide what to deploy: kernel dedup (ready) or kernel
+   fan-out (needs MAC refresh, one destination list, monitoring).
 3. Then cut the cost per copy (bypass the UDP/IP stack) if still needed.
 
 ## Log
@@ -107,4 +115,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven: p99 −55%, p50 −42%, CPU −80%; 3× shred-fanout not better than 3× proxy |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven (p99 −55%); userspace fan-out variants; kernel fan-out: p99 −87% vs dedup + proxies |
