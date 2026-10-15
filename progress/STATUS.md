@@ -72,6 +72,8 @@ candidates are now tested on production traffic with alternating A/B runs.
 - **`shred-fanout` threads being switched out:** they waited for a CPU only
   ~17 ms in 10 s.
 - **Queueing in the bond/VLAN devices:** both use `noqueue`.
+- **Fanning out across CPUs inside the kernel:** the hand-off to other CPUs
+  waits for the receiving CPU's whole packet batch; p99 got ~3× worse.
 - **Switching the 5544 source off:** no latency gain, and it loses ~0.13%
   of live shreds that only 5544 delivers.
 - **Lost shreds in the delivery dips:** every "missing" shred was a stale
