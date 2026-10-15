@@ -27,14 +27,17 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 ## Key findings
 
-1. **Most of the tail is queueing.** When little traffic arrived just before
+1. **Traffic is very bursty:** 46% of shreds arrive in bursts of over 64k
+   shreds/s, so send capacity during bursts matters as much as per-shred
+   speed.
+2. **Most of the tail is queueing.** When little traffic arrived just before
    a shred, the forwarder delivers it everywhere in ~70 µs (p50). Under normal
    load (86% of shreds) the same shred takes ~4.5× longer at p50 and 5–8× at
    p99, because it waits behind earlier shreds.
-2. **The biggest single cost is the coordinator waking the ~15 destination
+3. **The biggest single cost is the coordinator waking the ~15 destination
    worker threads one after another:** 65–130 µs per shred. Each extra thread
    hand-off costs ~10–13 µs, and each send ~4–8 µs.
-3. **Dead destinations are expensive.** Removing one local destination with
+4. **Dead destinations are expensive.** Removing one local destination with
    no listener halved p99 (6.2 → 3.1 ms) and sped up every other destination.
 
 ## Ruled out
@@ -47,10 +50,10 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 ## Open questions
 
-- Why is `shred-fanout` v1 slower than the current proxy (p50 439 vs
-  195 µs)? Its receive and hand-off are ~6× faster and its threads are not
-  preempted; the time is lost in or around the send. Suspected: queueing in
-  the bond/VLAN devices, or particular senders/destinations.
+- Is send capacity what limits `shred-fanout` v1? It is 2–4× faster than
+  the proxy when traffic is light, but much slower in dense bursts (46% of
+  shreds arrive at over 64k/s). Each copy costs ~4.6 µs, too much for 4
+  senders with 4 destinations each. Testing with 8 senders.
 
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
   isolated.
