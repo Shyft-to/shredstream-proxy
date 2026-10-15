@@ -69,9 +69,11 @@ mod linux {
         #[arg(long, env, default_value_t = Ipv4Addr::UNSPECIFIED)]
         src_bind_addr: Ipv4Addr,
 
-        /// Port to receive shreds on.
-        #[arg(long, env, default_value_t = 20_000)]
-        src_bind_port: u16,
+        /// Port(s) to receive shreds on, comma separated. With several ports,
+        /// one receiver polls them all and duplicates across ports are dropped,
+        /// so each shred is forwarded once, from whichever port got it first.
+        #[arg(long, env, value_delimiter = ',', default_value = "20000")]
+        src_bind_port: Vec<u16>,
 
         /// Destinations, comma separated: `10.0.0.1:8001,host:8002`.
         #[arg(long, env, value_delimiter = ',', required = true)]
@@ -151,20 +153,15 @@ mod linux {
         let dests = resolve_dests(&args.dest_ip_ports)?;
         let senders = args.sender_threads.clamp(1, dests.len());
 
-        let recv_socket =
-            UdpSocket::bind(SocketAddrV4::new(args.src_bind_addr, args.src_bind_port)).map_err(
-                |e| {
-                    format!(
-                        "cannot bind {}:{}: {e}",
-                        args.src_bind_addr, args.src_bind_port
-                    )
-                },
-            )?;
-        recv_socket
-            .set_nonblocking(true)
-            .map_err(|e| e.to_string())?;
-        if let Err(e) = set_recv_buffer(recv_socket.as_raw_fd(), RECV_BUFFER_BYTES) {
-            warn!("could not set receive buffer: {e}");
+        let mut recv_sockets = Vec::new();
+        for &port in &args.src_bind_port {
+            let socket = UdpSocket::bind(SocketAddrV4::new(args.src_bind_addr, port))
+                .map_err(|e| format!("cannot bind {}:{port}: {e}", args.src_bind_addr))?;
+            socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+            if let Err(e) = set_recv_buffer(socket.as_raw_fd(), RECV_BUFFER_BYTES) {
+                warn!("could not set receive buffer on port {port}: {e}");
+            }
+            recv_sockets.push(socket);
         }
 
         let stats = Arc::new(Stats::default());
@@ -204,7 +201,7 @@ mod linux {
                 .name("fanRecv".into())
                 .spawn(move || {
                     receive_loop(
-                        recv_socket,
+                        recv_sockets,
                         producer,
                         Deduper::new(dedup_generation),
                         cpu,
@@ -215,7 +212,7 @@ mod linux {
         }
 
         info!(
-            "forwarding {}:{} to {} destinations with {} senders",
+            "forwarding {} port(s) {:?} to {} destinations with {} senders",
             args.src_bind_addr,
             args.src_bind_port,
             dests.len(),
@@ -233,19 +230,25 @@ mod linux {
     }
 
     fn receive_loop(
-        socket: UdpSocket,
+        sockets: Vec<UdpSocket>,
         mut producer: Producer,
         mut dedup: Deduper,
         cpu: Option<usize>,
         stats: &Stats,
     ) {
         pin(cpu, "receiver");
-        let fd = socket.as_raw_fd();
+        let fds: Vec<_> = sockets.iter().map(|s| s.as_raw_fd()).collect();
         let mut batch = RecvBatch::new(RECV_BATCH);
-        loop {
+        let mut idle = 0;
+        // Poll the sockets in turn; spin only after a full round found nothing.
+        for &fd in fds.iter().cycle() {
             let n = match batch.recv(fd) {
                 Ok(0) => {
-                    std::hint::spin_loop();
+                    idle += 1;
+                    if idle >= fds.len() {
+                        idle = 0;
+                        std::hint::spin_loop();
+                    }
                     continue;
                 }
                 Ok(n) => n,
@@ -255,6 +258,7 @@ mod linux {
                     continue;
                 }
             };
+            idle = 0;
             let (mut dups, mut truncated, mut full) = (0, 0, 0);
             for i in 0..n {
                 match batch.packet(i) {

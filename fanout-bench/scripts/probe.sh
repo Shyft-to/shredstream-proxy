@@ -163,7 +163,8 @@ box() {
     lo_pcap="$CAP_DIR/box-$stamp-lo.pcap"
     echo "ports $ports (pids ${pids[*]}), $(tr ',' '\n' <<<"$all_dests" | wc -l) destinations, ${secs}s capture"
 
-    cpu_sum() { local s=0 x; for x in "${pids[@]}"; do s=$((s + $(cpu_ms "$x"))); done; echo "$s"; }
+    # One process may own several ports; count each process once.
+    cpu_sum() { local s=0 x; for x in $(printf '%s\n' "${pids[@]}" | sort -u); do s=$((s + $(cpu_ms "$x"))); done; echo "$s"; }
     nstat -n
     local c0 c1 drops
     c0=$(cpu_sum)

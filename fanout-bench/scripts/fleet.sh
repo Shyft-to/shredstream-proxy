@@ -14,6 +14,8 @@
 #
 # Settings (environment):
 #   DEDUP=on|off   kernel dedup filter during the whole test (default off)
+#   B_SINGLE=1     run side B as ONE process listening on all PORTS (first
+#                  port's arguments, with --src-bind-port set to PORTS)
 #   WARMUP_S (10), MEASURE_S (10), OUT (./bench-results)
 set -euo pipefail
 
@@ -26,7 +28,7 @@ WARMUP_S=${WARMUP_S:-10}
 MEASURE_S=${MEASURE_S:-10}
 DEDUP=${DEDUP:-off}
 
-[ $# -eq 6 ] || { sed -n '2,18p' "$0"; exit 1; }
+[ $# -eq 6 ] || { sed -n '2,20p' "$0"; exit 1; }
 PORTS=$1 PAIRS=$2 A_LABEL=$3 A_BIN=$4 B_LABEL=$5 B_BIN=$6
 for b in "$A_BIN" "$B_BIN"; do [ -x "$b" ] || { echo "not executable: $b" >&2; exit 1; }; done
 [[ "$DEDUP" == on || "$DEDUP" == off ]] || { echo "DEDUP must be on or off" >&2; exit 1; }
@@ -62,6 +64,7 @@ done
 
 a_label="$A_LABEL-dedup$DEDUP@$run_id"
 b_label="$B_LABEL-dedup$DEDUP@$run_id"
+[ "${B_SINGLE:-0}" = "1" ] && b_label="$B_LABEL-single-dedup$DEDUP@$run_id"
 echo "plan: $PAIRS pairs of $a_label / $b_label, filter $DEDUP, ${WARMUP_S}s warmup + ${MEASURE_S}s measure each"
 
 children=()
@@ -96,15 +99,39 @@ trap 'exit 143' TERM
 for p in ${PORTS//,/ }; do wait_port_free "$p"; done
 [ "$DEDUP" = on ] && "$DEDUP_SH" attach "$PORTS"
 
-run_side() {
-    local label=$1 bin=$2 n=$3 p args=()
-    echo "--- $label ($n/$PAIRS)"
-    for p in ${PORTS//,/ }; do
-        mapfile -d '' args <"${ARGS_FILE[$p]}"
-        (cd "${CWD[$p]}" && exec env ${RUST_LOG_OF[$p]:+RUST_LOG="${RUST_LOG_OF[$p]}"} "$bin" "${args[@]}") \
-            >"$logdir/$label-$p-$n.log" 2>&1 &
-        children+=($!)
+start_one() { # PORT BINARY LOGFILE ARGS...
+    local p=$1 bin=$2 log=$3
+    shift 3
+    (cd "${CWD[$p]}" && exec env ${RUST_LOG_OF[$p]:+RUST_LOG="${RUST_LOG_OF[$p]}"} "$bin" "$@") >"$log" 2>&1 &
+    children+=($!)
+}
+
+# Rewrites --src-bind-port in the array named $1 to $2.
+set_ports() {
+    local -n arr=$1
+    local i
+    for i in "${!arr[@]}"; do
+        case "${arr[$i]}" in
+        --src-bind-port) arr[$((i + 1))]=$2 ;;
+        --src-bind-port=*) arr[$i]="--src-bind-port=$2" ;;
+        esac
     done
+}
+
+run_side() {
+    local label=$1 bin=$2 n=$3 single=${4:-0} p args=()
+    echo "--- $label ($n/$PAIRS)"
+    if [ "$single" = "1" ]; then
+        local first=${PORTS%%,*}
+        mapfile -d '' args <"${ARGS_FILE[$first]}"
+        set_ports args "$PORTS"
+        start_one "$first" "$bin" "$logdir/$label-all-$n.log" "${args[@]}"
+    else
+        for p in ${PORTS//,/ }; do
+            mapfile -d '' args <"${ARGS_FILE[$p]}"
+            start_one "$p" "$bin" "$logdir/$label-$p-$n.log" "${args[@]}"
+        done
+    fi
     sleep "$WARMUP_S"
     for p in ${PORTS//,/ }; do
         [ -n "$(port_pid "$p")" ] || { echo "$bin is not listening on $p; see $logdir/$label-$p-$n.log" >&2; return 1; }
@@ -116,7 +143,7 @@ run_side() {
 
 for n in $(seq 1 "$PAIRS"); do
     run_side "$a_label" "$A_BIN" "$n"
-    run_side "$b_label" "$B_BIN" "$n"
+    run_side "$b_label" "$B_BIN" "$n" "${B_SINGLE:-0}"
 done
 
 for metric in completion.p99_us completion.p50_us first_dest.p50_us cpu_ms; do
