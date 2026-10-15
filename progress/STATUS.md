@@ -71,6 +71,8 @@ candidates are now tested on production traffic with alternating A/B runs.
 - **`shred-fanout` threads being switched out:** they waited for a CPU only
   ~17 ms in 10 s.
 - **Queueing in the bond/VLAN devices:** both use `noqueue`.
+- **Switching the 5544 source off:** no latency gain, and it loses ~0.13%
+  of live shreds that only 5544 delivers.
 - **Lost shreds in the delivery dips:** every "missing" shred was a stale
   re-send (4 s–1 min old) from the 5544 source, already forwarded live; no
   live shred was missing. The probe now excludes stale re-sends.
@@ -88,9 +90,6 @@ candidates are now tested on production traffic with alternating A/B runs.
   in the lab)? Suspected: ~2.8 µs per copy through VLAN, bond and NIC
   driver, serially on one CPU per source, saturating in bursts. And what
   does it cost in kernel CPU?
-- Should stale shreds (seconds old, re-sent by the 5544 source) be dropped
-  in the kernel? Saves ~20% of the fan-out work, unless consumers use late
-  shreds to fill gaps.
 - Which process still sends to the old dead IPs (`FAILED` in the neighbour
   table)?
 - Is the queue mainly at the coordinator's serial wakeups? Likely, not yet
