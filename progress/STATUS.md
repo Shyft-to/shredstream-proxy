@@ -62,12 +62,14 @@ candidates are now tested on production traffic with alternating A/B runs.
 
 1. A/A test on production (baseline vs itself) to validate the A/B method
    and its noise level.
-2. A/B test the existing busy-spin build (`opt_1_1`) on production.
-3. Prototype an eBPF fan-out (no thread hand-offs, cheaper per copy).
+2. A/B test our new forwarder `shred-fanout` (branch `fanout-opt`:
+   busy-polling receiver, pinned senders, no sleeping hand-offs) on
+   production.
+3. Then an eBPF fan-out (no threads at all, cheaper per copy).
 
 ## Log
 
 | Chapter | Date | Summary |
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
-| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B) |
+| [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); new forwarder `shred-fanout` built |

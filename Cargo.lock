@@ -4789,6 +4789,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "shred-fanout"
+version = "0.2.13"
+dependencies = [
+ "ahash 0.8.11",
+ "clap",
+ "env_logger 0.11.7",
+ "libc",
+ "log",
+]
+
+[[package]]
 name = "signal-hook"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

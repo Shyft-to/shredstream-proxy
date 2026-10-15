@@ -1,0 +1,15 @@
+[package]
+name = "shred-fanout"
+version = { workspace = true }
+description = "Low-latency UDP shred fan-out: busy-polling receiver, pinned sender threads, no sleeping hand-offs"
+authors = { workspace = true }
+homepage = { workspace = true }
+edition = { workspace = true }
+publish = false
+
+[dependencies]
+ahash = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
