@@ -45,7 +45,6 @@ FWD_CPU=${FWD_CPU:-28}
 MODE=${MODE:-zc}
 STEER=${STEER:-1}
 OUT=${OUT:-./bench-results}
-RULE_BASE=7700
 
 ifaces() {
     if [ -e "/sys/class/net/$DEV/bonding/slaves" ]; then
@@ -101,14 +100,19 @@ setup() {
     fi
     mkdir -p "$PIN"
     : >"$STATE"
+    # Any failure from here on undoes everything done so far.
+    trap 'echo "setup failed; undoing what was set up" >&2; trap - ERR; teardown' ERR
     for iface in $(ifaces); do
         echo "--- $iface"
         if [ "$STEER" = 1 ]; then
-            local j=0
+            local out id
             for p in ${ports//,/ }; do
-                ethtool -N "$iface" flow-type udp4 dst-port "$p" action "$QUEUE" loc $((RULE_BASE + j)) >/dev/null
-                echo "rule $iface $((RULE_BASE + j))" >>"$STATE"
-                j=$((j + 1))
+                # Let the driver pick the rule slot (the valid range varies by NIC).
+                out=$(ethtool -N "$iface" flow-type udp4 dst-port "$p" action "$QUEUE" 2>&1) ||
+                    { echo "  steering rule for UDP $p refused: $out" >&2; false; }
+                id=$(grep -oP 'ID \K[0-9]+' <<<"$out" || true)
+                [ -n "$id" ] || { echo "  steering rule for UDP $p: no rule ID in: $out" >&2; false; }
+                echo "rule $iface $id" >>"$STATE"
             done
             echo "  UDP ports $ports -> queue $QUEUE"
         fi
@@ -126,6 +130,7 @@ setup() {
         sleep 2
         k=$((k + 1))
     done
+    trap - ERR
     echo "setup done; start the forwarder with: xsk.sh run DESTS"
 }
 
