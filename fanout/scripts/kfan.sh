@@ -46,6 +46,7 @@ resolve() {
     if [[ "$ip" == 127.* ]]; then
         ifindex=$(cat /sys/class/net/lo/ifindex)
         echo "$(hex_le32 "$ifindex") 00 00 00 00 00 00 00 00 00 00 00 00 $(hex_ip "$ip") $(hex_ip "$ip") $(hex_be16 "$port") 00 00"
+        echo "  $1 -> dev lo (local delivery), from $ip" >&2
         return
     fi
     route=$(ip -o route get "$ip")
