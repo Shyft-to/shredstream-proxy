@@ -24,8 +24,9 @@
 #   fan-out. Destinations are split into n groups; group 0 is sent on the
 #   receiving CPU, group i on CPU ci (receive packet steering on DEV rx-0).
 #   Also raises net.core.netdev_max_backlog to >= 10000. Detach restores both.
-#   STAMP_PORT=p: the copy to the destination with UDP port p (a fanout-bench
-#   stamp-recv receiver; list it last) carries the arrival time; see kfan.bpf.c.
+#   STAMP_PORT=p: copies to destinations with UDP port p (fanout-bench
+#   stamp-recv receivers) carry the arrival time (driver level if
+#   xdpstamp.sh is attached); see kfan.bpf.c.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -197,7 +198,7 @@ log_counters() {
     bpftool -j map dump name kfan_stats 2>/dev/null | python3 -c '
 import json, sys
 names = ["first", "dup", "short", "error", "no_dests", "sent", "refused", "ignored",
-         "carried", "carry_fail", "stamped", "stamp_skip"]
+         "carried", "carry_fail", "stamped", "stamp_noxdp"]
 show = ["first", "dup", "sent", "refused", "no_dests", "error", "short"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
@@ -351,7 +352,7 @@ counters() {
 import json, sys
 names = ["first copies", "duplicates (dropped)", "too short (passed)", "dedup error (passed)",
          "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)",
-         "carriers to other CPUs", "carriers refused", "stamped copies", "stamp skipped (not last)"]
+         "carriers to other CPUs", "carriers refused", "stamped copies", "stamped without XDP time"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:
@@ -412,5 +413,5 @@ case "${1:-}" in
     watch) shift; watch_ports "$@" ;;
     run) shift; run "$@" ;;
     check-dests) shift; check_dests "$@" ;;
-    *) sed -n '2,28p' "$0"; exit 1 ;;
+    *) sed -n '2,29p' "$0"; exit 1 ;;
 esac

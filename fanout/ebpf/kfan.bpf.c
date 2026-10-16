@@ -13,11 +13,14 @@
  * Optional -DDROP_A=... [-DDROP_B=...]: UDP to these ports is dropped before
  * anything else (e.g. to switch a source off without stopping its forwarder).
  *
- * Optional -DSTAMP_PORT=...: the copy for the destination with this UDP port
- * (a measurement receiver, fanout-bench stamp-recv) gets its first 16 payload
- * bytes replaced by "kfanstmp" + this program's arrival time (u64 LE,
- * CLOCK_MONOTONIC). Only done when that destination is the last one of its
- * group, since later copies would carry the change too.
+ * Optional -DSTAMP_PORT=...: copies for destinations with this UDP port
+ * (measurement receivers, fanout-bench stamp-recv) get their first 16 payload
+ * bytes replaced by a tag + the shred's arrival time (u64 LE,
+ * CLOCK_MONOTONIC); the bytes are restored right after, so later copies are
+ * untouched. The time is the one xdpstamp.bpf.c wrote into the packet's
+ * metadata when the NIC driver first saw it ("kfanxdps": includes any
+ * queueing before this program), or else when this program started on it
+ * ("kfanstmp": excludes that queueing).
  *
  * Multi-CPU fan-out (-DGROUPS=n, n > 1): destinations are split into n
  * groups. Group 0 is sent inline on the CPU that received the shred. For each
@@ -59,7 +62,9 @@
 #ifndef STAMP_PORT
 #define STAMP_PORT 0
 #endif
-#define STAMP_MAGIC 0x706d74736e61666bULL /* "kfanstmp" */
+#define STAMP_MAGIC 0x706d74736e61666bULL     /* "kfanstmp": this program's time */
+#define STAMP_XDP_MAGIC 0x737064786e61666bULL /* "kfanxdps": the driver-level time */
+#define XDP_META_MAGIC 0x31706d7473706478ULL  /* "xdpstmp1", written by xdpstamp.bpf.c */
 
 #ifndef GROUPS
 #define GROUPS 1
@@ -119,7 +124,7 @@ enum {
 	STAT_CARRIED,    /* carrier copies handed to another CPU */
 	STAT_CARRY_FAIL, /* carrier copies the kernel refused */
 	STAT_STAMPED,    /* copies to STAMP_PORT stamped */
-	STAT_STAMP_SKIP, /* STAMP_PORT destination not last: sent unstamped */
+	STAT_STAMP_NOXDP, /* of which without a driver-level time (this program's time used) */
 	STAT_MAX,
 };
 
@@ -147,7 +152,7 @@ static __always_inline int watched(__u16 port)
 /* Sends the shred to every destination of group g. Rewrites headers in place
  * (UDP source port and checksum are set by the caller). */
 static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
-				       __be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns)
+				       __be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns, __u64 magic)
 {
 	struct dest *d;
 	__u16 cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
@@ -181,17 +186,22 @@ static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
 			cur_vlan = d->vlan;
 		}
 		if (STAMP_PORT && d->dport == bpf_htons(STAMP_PORT)) {
-			__u32 next = k + 1;
-			struct dest *nd = i + 1 < MAX_PER_GROUP ? bpf_map_lookup_elem(&kfan_dests, &next) : 0;
+			__u64 orig[2], stamp[2] = {magic, rx_ns};
+			__u32 off = l4 + sizeof(struct udphdr);
 
-			if (!nd || !nd->ifindex) {
-				__u64 stamp[2] = {STAMP_MAGIC, rx_ns};
-
-				bpf_skb_store_bytes(skb, l4 + sizeof(struct udphdr), stamp, sizeof(stamp), 0);
-				count(STAT_STAMPED);
-			} else {
-				count(STAT_STAMP_SKIP);
-			}
+			if (bpf_skb_load_bytes(skb, off, orig, sizeof(orig)))
+				continue;
+			bpf_skb_store_bytes(skb, off, stamp, sizeof(stamp), 0);
+			if (bpf_clone_redirect(skb, d->ifindex, 0))
+				count(STAT_CLONE_FAIL);
+			else
+				count(STAT_CLONED);
+			/* Later copies get the shred as it arrived. */
+			bpf_skb_store_bytes(skb, off, orig, sizeof(orig), 0);
+			count(STAT_STAMPED);
+			if (magic != STAMP_XDP_MAGIC)
+				count(STAT_STAMP_NOXDP);
+			continue;
 		}
 		if (bpf_clone_redirect(skb, d->ifindex, 0))
 			count(STAT_CLONE_FAIL);
@@ -207,7 +217,7 @@ int kfan(struct __sk_buff *skb)
 	struct udphdr udp;
 	struct shred_key key;
 	struct dest *d;
-	__u64 rx_ns = STAMP_PORT ? bpf_ktime_get_ns() : 0;
+	__u64 rx_ns = 0, magic = STAMP_MAGIC;
 	__u8 first_byte;
 	__u32 ihl, l4, g = 0, zero = 0;
 	__be16 sport;
@@ -216,6 +226,18 @@ int kfan(struct __sk_buff *skb)
 
 	if (skb->protocol != bpf_htons(ETH_P_IP))
 		return TC_ACT_OK;
+	if (STAMP_PORT) {
+		/* Arrival time from the driver level, if xdpstamp is loaded. */
+		void *data = (void *)(long)skb->data;
+		__u64 *meta = (void *)(long)skb->data_meta;
+
+		if ((void *)(meta + 2) <= data && meta[0] == XDP_META_MAGIC) {
+			rx_ns = meta[1];
+			magic = STAMP_XDP_MAGIC;
+		} else {
+			rx_ns = bpf_ktime_get_ns();
+		}
+	}
 	if (bpf_skb_load_bytes(skb, ETH_HLEN, &first_byte, 1))
 		return TC_ACT_OK;
 	ihl = (first_byte & 0x0f) * 4;
@@ -291,7 +313,7 @@ int kfan(struct __sk_buff *skb)
 	sport = udp.dest;
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, source), &sport, sizeof(sport), 0);
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, check), &no_csum, sizeof(no_csum), 0);
-	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns);
+	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns, magic);
 	return TC_ACT_SHOT;
 }
 

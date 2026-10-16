@@ -1,7 +1,9 @@
 //! Runs on a destination host. Receives the stamped shred copies that the
 //! forwarders (kfan with STAMP_PORT, xskfwd with --stamp-port) send to this
 //! port, and reports the one-way latency from the shred's first arrival on the
-//! forwarder host to its arrival here (kernel receive timestamp).
+//! forwarder host to its arrival here (kernel receive timestamp). Modes:
+//! "kfan-xdp" (arrival = NIC driver, xdpstamp.sh), "kfan" (arrival = when the
+//! kernel fan-out started on it), "xsk" (AF_XDP forwarder).
 //!
 //! The stamp is the forwarder host's CLOCK_MONOTONIC. A second thread keeps
 //! mapping that clock onto this host's clock by probing `clock-echo` on the
@@ -161,7 +163,11 @@ struct Window {
 
 fn mode_of(magic: &[u8]) -> Option<&'static str> {
     match magic {
+        // Kernel fan-out, time taken when its program started on the shred
+        // (excludes queueing before it).
         b"kfanstmp" => Some("kfan"),
+        // Kernel fan-out, time taken at the NIC driver (xdpstamp.sh).
+        b"kfanxdps" => Some("kfan-xdp"),
         b"xskstamp" => Some("xsk"),
         _ => None,
     }
