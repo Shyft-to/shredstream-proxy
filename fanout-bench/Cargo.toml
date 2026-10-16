@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 clap = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -23,3 +24,11 @@ path = "src/bin/shred_replay.rs"
 [[bin]]
 name = "udp-sink"
 path = "src/bin/udp_sink.rs"
+
+[[bin]]
+name = "clock-echo"
+path = "src/bin/clock_echo.rs"
+
+[[bin]]
+name = "stamp-recv"
+path = "src/bin/stamp_recv.rs"

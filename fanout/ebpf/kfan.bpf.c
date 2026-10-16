@@ -13,6 +13,12 @@
  * Optional -DDROP_A=... [-DDROP_B=...]: UDP to these ports is dropped before
  * anything else (e.g. to switch a source off without stopping its forwarder).
  *
+ * Optional -DSTAMP_PORT=...: the copy for the destination with this UDP port
+ * (a measurement receiver, fanout-bench stamp-recv) gets its first 16 payload
+ * bytes replaced by "kfanstmp" + this program's arrival time (u64 LE,
+ * CLOCK_MONOTONIC). Only done when that destination is the last one of its
+ * group, since later copies would carry the change too.
+ *
  * Multi-CPU fan-out (-DGROUPS=n, n > 1): destinations are split into n
  * groups. Group 0 is sent inline on the CPU that received the shred. For each
  * other group a "carrier" copy of the untouched packet is re-injected into
@@ -49,6 +55,11 @@
 #ifndef DROP_B
 #define DROP_B 0
 #endif
+
+#ifndef STAMP_PORT
+#define STAMP_PORT 0
+#endif
+#define STAMP_MAGIC 0x706d74736e61666bULL /* "kfanstmp" */
 
 #ifndef GROUPS
 #define GROUPS 1
@@ -107,6 +118,8 @@ enum {
 	STAT_IGNORED,    /* UDP to a DROP_ port, dropped */
 	STAT_CARRIED,    /* carrier copies handed to another CPU */
 	STAT_CARRY_FAIL, /* carrier copies the kernel refused */
+	STAT_STAMPED,    /* copies to STAMP_PORT stamped */
+	STAT_STAMP_SKIP, /* STAMP_PORT destination not last: sent unstamped */
 	STAT_MAX,
 };
 
@@ -134,7 +147,7 @@ static __always_inline int watched(__u16 port)
 /* Sends the shred to every destination of group g. Rewrites headers in place
  * (UDP source port and checksum are set by the caller). */
 static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
-				       __be32 cur_saddr, __be32 cur_daddr)
+				       __be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns)
 {
 	struct dest *d;
 	__u16 cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
@@ -167,6 +180,19 @@ static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
 				bpf_skb_vlan_push(skb, bpf_htons(ETH_P_8021Q), d->vlan);
 			cur_vlan = d->vlan;
 		}
+		if (STAMP_PORT && d->dport == bpf_htons(STAMP_PORT)) {
+			__u32 next = k + 1;
+			struct dest *nd = i + 1 < MAX_PER_GROUP ? bpf_map_lookup_elem(&kfan_dests, &next) : 0;
+
+			if (!nd || !nd->ifindex) {
+				__u64 stamp[2] = {STAMP_MAGIC, rx_ns};
+
+				bpf_skb_store_bytes(skb, l4 + sizeof(struct udphdr), stamp, sizeof(stamp), 0);
+				count(STAT_STAMPED);
+			} else {
+				count(STAT_STAMP_SKIP);
+			}
+		}
 		if (bpf_clone_redirect(skb, d->ifindex, 0))
 			count(STAT_CLONE_FAIL);
 		else
@@ -181,6 +207,7 @@ int kfan(struct __sk_buff *skb)
 	struct udphdr udp;
 	struct shred_key key;
 	struct dest *d;
+	__u64 rx_ns = STAMP_PORT ? bpf_ktime_get_ns() : 0;
 	__u8 first_byte;
 	__u32 ihl, l4, g = 0, zero = 0;
 	__be16 sport;
@@ -264,7 +291,7 @@ int kfan(struct __sk_buff *skb)
 	sport = udp.dest;
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, source), &sport, sizeof(sport), 0);
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, check), &no_csum, sizeof(no_csum), 0);
-	send_group(skb, g, l4, ip.saddr, ip.daddr);
+	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns);
 	return TC_ACT_SHOT;
 }
 

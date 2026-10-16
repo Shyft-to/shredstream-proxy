@@ -22,6 +22,8 @@
 #   FWD_CPU (28)       CPU the forwarder busy-polls on
 #   LOCAL_CPU (unset)  if set, local (127.x) destinations are sent by a second
 #                      busy-polling thread on this CPU instead of inline
+#   STAMP_PORT (unset) copies to the destination with this UDP port carry the
+#                      arrival time (for a fanout-bench stamp-recv receiver)
 #   MODE (zc)         zc = zero-copy; copy = copy mode (e.g. virtual devices in the lab)
 #   STEER (1)          0 = no flow rules (devices without ntuple support)
 #   PIN (/sys/fs/bpf/xskfwd)  where the shared maps are pinned; its parent must be
@@ -45,6 +47,7 @@ QUEUE=${QUEUE:-47}
 IRQ_CPUS=${IRQ_CPUS:-29,30}
 FWD_CPU=${FWD_CPU:-28}
 LOCAL_CPU=${LOCAL_CPU:-}
+STAMP_PORT=${STAMP_PORT:-}
 MODE=${MODE:-zc}
 STEER=${STEER:-1}
 OUT=${OUT:-./bench-results}
@@ -221,7 +224,8 @@ run() {
     rx=$(ifaces | paste -sd,)
     exec "$FWD" --rx "$rx" --queue "$QUEUE" --dests "$file" --pin "$PIN" --cpu "$FWD_CPU" \
         $(if [ "$MODE" = copy ]; then echo --copy; fi) \
-        $(if [ -n "$LOCAL_CPU" ]; then echo --local-cpu "$LOCAL_CPU"; fi) --label "$label" \
+        $(if [ -n "$LOCAL_CPU" ]; then echo --local-cpu "$LOCAL_CPU"; fi) \
+        $(if [ -n "$STAMP_PORT" ]; then echo --stamp-port "$STAMP_PORT"; fi) --label "$label" \
         --results "$OUT/xsk-results.jsonl"
 }
 

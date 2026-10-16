@@ -20,6 +20,8 @@
 #   fan-out. Destinations are split into n groups; group 0 is sent on the
 #   receiving CPU, group i on CPU ci (receive packet steering on DEV rx-0).
 #   Also raises net.core.netdev_max_backlog to >= 10000. Detach restores both.
+#   STAMP_PORT=p: the copy to the destination with UDP port p (a fanout-bench
+#   stamp-recv receiver; list it last) carries the arrival time; see kfan.bpf.c.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,6 +30,7 @@ OBJ=/run/fanout-kfan.bpf.o
 DEV=${DEV:-bond0}
 DROP_PORTS=${DROP_PORTS:-}
 DIRECT=${DIRECT:-0}
+STAMP_PORT=${STAMP_PORT:-}
 KFAN_GROUPS=${KFAN_GROUPS:-1}
 KFAN_CPUS=${KFAN_CPUS:-}
 PREF=7700
@@ -53,6 +56,10 @@ build() {
         i=$((i + 1))
     done
     defs+=("-DGROUPS=$KFAN_GROUPS")
+    if [ -n "$STAMP_PORT" ]; then
+        [[ "$STAMP_PORT" =~ ^[0-9]+$ ]] || { echo "bad STAMP_PORT: $STAMP_PORT" >&2; exit 1; }
+        defs+=("-DSTAMP_PORT=$STAMP_PORT")
+    fi
     clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
         "${defs[@]}" -c "$SRC" -o "$OBJ"
 }
@@ -243,7 +250,7 @@ counters() {
 import json, sys
 names = ["first copies", "duplicates (dropped)", "too short (passed)", "dedup error (passed)",
          "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)",
-         "carriers to other CPUs", "carriers refused"]
+         "carriers to other CPUs", "carriers refused", "stamped copies", "stamp skipped (not last)"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:

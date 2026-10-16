@@ -15,6 +15,9 @@
  * Usage: xskfwd --rx IF[,IF] --queue Q --dests FILE [--pin DIR] [--cpu N]
  *               [--copy] [--report SECS] [--label L] [--results FILE]
  *               [--local-cpu N]   (local sends on their own thread on cpu N)
+ *               [--stamp-port P]  (copies to UDP port P start with "xskstamp" +
+ *                                  arrival time, u64 LE CLOCK_MONOTONIC, for
+ *                                  fanout-bench stamp-recv)
  *
  * DESTS file, one destination per line (written by fanout/scripts/xsk.sh):
  *   IFNAME DST_MAC SRC_MAC SRC_IP DST_IP DST_PORT VLAN
@@ -53,6 +56,7 @@
 #define MAX_DESTS 32
 #define QUEUES_PER_SLOT 64
 #define META_MAGIC 0x78736b6d65746131ULL
+#define STAMP_MAGIC 0x706d6174736b7378ULL /* "xskstamp" */
 #define LOCAL_RING 1024          /* shreds queued for the local-send thread */
 #define LOCAL_MAX 2036           /* largest payload it takes */
 #define STALL_NS 20000           /* an idle loop pass longer than this was interrupted */
@@ -132,6 +136,7 @@ struct port {
 struct dest {
 	int local;              /* send with a UDP socket instead */
 	int port;               /* index into ports */
+	int stamp;              /* measurement receiver: replace the payload start with a stamp */
 	uint8_t hdr[64];        /* Ethernet [+ 802.1Q] + IPv4 + UDP, lengths/checksum filled per packet */
 	uint32_t hdr_len, ip_off;
 	uint32_t ip_sum;        /* IPv4 header sum without tot_len */
@@ -145,6 +150,7 @@ static int ndests;
 static volatile sig_atomic_t running = 1;
 static int local_fd = -1;
 static int nlocal;
+static unsigned stamp_port;
 
 static struct {
 	uint64_t shreds, copies, tx_full, local_fail, no_meta;
@@ -299,6 +305,7 @@ static void load_dests(const char *path)
 		d->ip_sum = sum16(ip, 20, 0); /* tot_len and checksum still 0 */
 		uint8_t *udp = ip + 20;
 		udp[2] = dport >> 8, udp[3] = dport & 0xff;
+		d->stamp = stamp_port && dport == stamp_port;
 		d->hdr_len = o + 20 + 8;
 		ndests++;
 		continue;
@@ -465,7 +472,8 @@ static void reclaim(struct port *p)
 }
 
 /* Queues one copy on the destination's port. Returns 0 if queued. */
-static int queue_copy(struct dest *d, const uint8_t *payload, uint32_t plen, uint16_t sport_be)
+static int queue_copy(struct dest *d, const uint8_t *payload, uint32_t plen, uint16_t sport_be,
+		      uint64_t rx_ns)
 {
 	struct port *q = &ports[d->port];
 	uint32_t tidx, len = d->hdr_len + plen;
@@ -494,6 +502,11 @@ static int queue_copy(struct dest *d, const uint8_t *payload, uint32_t plen, uin
 	memcpy(udp, &sport_be, 2);
 	udp[4] = ulen >> 8, udp[5] = ulen & 0xff; /* UDP checksum stays 0 (none) */
 	memcpy(udp + 8, payload, plen);
+	if (d->stamp && plen >= 16) {
+		uint64_t stamp[2] = {STAMP_MAGIC, rx_ns};
+
+		memcpy(udp + 8, stamp, sizeof(stamp));
+	}
 	desc = xsk_ring_prod__tx_desc(&q->tx, tidx);
 	desc->addr = addr;
 	desc->len = len;
@@ -535,7 +548,7 @@ static void handle(uint8_t *pkt, uint32_t len)
 	for (int i = 0; i < ndests; i++) {
 		if (dests[i].local)
 			continue;
-		if (queue_copy(&dests[i], payload, plen, sport_be)) {
+		if (queue_copy(&dests[i], payload, plen, sport_be, rx_ns)) {
 			st.tx_full++;
 			continue;
 		}
@@ -675,6 +688,7 @@ int main(int argc, char **argv)
 		{"cpu", required_argument, 0, 'c'},    {"copy", no_argument, 0, 'C'},
 		{"report", required_argument, 0, 'R'}, {"label", required_argument, 0, 'l'},
 		{"results", required_argument, 0, 'o'}, {"local-cpu", required_argument, 0, 'L'},
+		{"stamp-port", required_argument, 0, 'S'},
 		{0, 0, 0, 0},
 	};
 	int o;
@@ -691,6 +705,7 @@ int main(int argc, char **argv)
 		case 'l': label = optarg; break;
 		case 'o': results = optarg; break;
 		case 'L': local_cpu = atoi(optarg); break;
+		case 'S': stamp_port = (unsigned)atoi(optarg); break;
 		default: goto usage;
 		}
 	}
@@ -815,7 +830,8 @@ int main(int argc, char **argv)
 
 usage:
 	fprintf(stderr, "usage: %s --rx IF[,IF] --queue Q --dests FILE [--pin DIR] [--cpu N] [--copy]\n"
-			"       [--report SECS] [--label L] [--results FILE] [--local-cpu N]\n",
+			"       [--report SECS] [--label L] [--results FILE] [--local-cpu N]\n"
+			"       [--stamp-port P]\n",
 		argv[0]);
 	return 2;
 }
