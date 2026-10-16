@@ -224,13 +224,18 @@ print(("WARNING " + ",".join(bad) + " increasing | " if bad else "") + line)
 # Reloads the table whenever the set of active bond ports changes, and
 # re-resolves MACs every REFRESH_S seconds. Runs until interrupted.
 watch_ports() {
-    local dests=$1 last="" now t=0 lt=0
+    local dests=$1 last="" now t=0 lt=0 out
     ours || { echo "kfan is not attached" >&2; exit 1; }
     while true; do
         now=$(for b in /sys/class/net/*/bonding; do ports_of "$(basename "$(dirname "$b")")"; done | sort | paste -sd,)
         if [ "$now" != "$last" ] || [ $t -ge "${REFRESH_S:-60}" ]; then
             [ -n "$last" ] && [ "$now" != "$last" ] && echo "$(date +%T) active ports changed: $last -> $now"
-            load_dests "$dests" 2>/dev/null || echo "$(date +%T) reload failed" >&2
+            # Routine MAC refreshes stay quiet; port changes and failures are logged.
+            if out=$(load_dests "$dests" 2>&1); then
+                [ -n "$last" ] && [ "$now" != "$last" ] && echo "$(date +%T) $(tail -1 <<<"$out")"
+            else
+                echo "$(date +%T) reload failed, keeping the previous table: $(tail -1 <<<"$out")" >&2
+            fi
             last=$now
             t=0
         fi
