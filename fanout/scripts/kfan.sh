@@ -41,6 +41,7 @@ KFAN_CPUS=${KFAN_CPUS:-}
 PREF=7700
 PER_GROUP=16
 STATE=/run/fanout-kfan.state
+LO_STATE=/run/fanout-kfan.lo-sysctl
 
 attached() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -q "pref $PREF "; }
 ours() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -A1 "pref $PREF " | grep -q kfan; }
@@ -132,10 +133,43 @@ resolve() {
 # group, entries are ordered by VLAN tag (the program changes the tag at most
 # once per group). Writes every group's entries and terminator, and entry 0 of
 # group 0 last: until it is set the program passes all traffic on.
+# Local destinations (127.x): the copy is handed to lo as a raw packet, with no
+# route attached (a normal local send carries one). The kernel then checks it
+# like a packet from outside and drops it twice over: a 127.x destination
+# (route_localnet) and a local source address (accept_local). Allowing both
+# on lo only fixes delivery; it affects only packets that reach lo without a
+# route, which does not happen otherwise. The previous values are restored on
+# detach.
+lo_local_on() {
+    local k
+    if [ ! -e "$LO_STATE" ]; then
+        printf 'route_localnet=%s\naccept_local=%s\n' "$(sysctl -n net.ipv4.conf.lo.route_localnet)" \
+            "$(sysctl -n net.ipv4.conf.lo.accept_local)" >"$LO_STATE"
+    fi
+    for k in route_localnet accept_local; do
+        [ "$(sysctl -n "net.ipv4.conf.lo.$k")" = 1 ] || sysctl -qw "net.ipv4.conf.lo.$k=1"
+    done
+}
+
+lo_local_off() {
+    [ -e "$LO_STATE" ] || return 0
+    local k v
+    for k in route_localnet accept_local; do
+        v=$(grep "^$k=" "$LO_STATE" | cut -d= -f2)
+        [ -z "$v" ] || sysctl -qw "net.ipv4.conf.lo.$k=$v" || true
+    done
+    rm -f "$LO_STATE"
+}
+
 load_dests() {
     local dests=() groups=() entries=() d j=0 g i n line first=""
     IFS=, read -ra dests <<<"$1"
     [ ${#dests[@]} -ge 1 ] || { echo "no destinations" >&2; return 1; }
+    # Before any local copy is sent (see lo_local_on).
+    if [[ ",$1" == *,127.* ]]; then
+        lo_local_on
+        echo "local destinations: lo route_localnet=1 accept_local=1 (restored on detach)"
+    fi
     for ((g = 0; g < KFAN_GROUPS; g++)); do groups[g]=""; done
     for d in "${dests[@]}"; do
         line=$(resolve "$d" "$j") || return 1
@@ -345,6 +379,7 @@ detach() {
         echo "not attached"
     fi
     steer_off
+    lo_local_off
 }
 
 counters() {

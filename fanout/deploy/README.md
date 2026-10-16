@@ -51,6 +51,13 @@ sudo systemctl restart shred-kfan
 
 ## Notes
 
+- **Local destinations (127.x):** the copy is handed to `lo` without a route,
+  which the kernel drops unless `net.ipv4.conf.lo.route_localnet=1` and
+  `net.ipv4.conf.lo.accept_local=1`. kfan.sh sets both (on `lo` only) when
+  DESTS has a 127.x entry and restores them on stop. A capture on `lo` shows
+  these copies even when they are dropped, so check delivery at the consuming
+  service itself.
+
 - A destination whose next-hop MAC cannot be resolved makes the start fail
   (the service retries every 10 s; the proxies forward meanwhile). At
   runtime a failed refresh keeps the previous table.
