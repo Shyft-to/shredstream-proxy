@@ -1,6 +1,6 @@
 # Fan-out latency — status
 
-_Updated 2026-10-15_
+_Updated 2026-10-16_
 
 ## Goal
 
@@ -25,6 +25,8 @@ implementation is measured the same way
 | **Box level, kernel fan-out, direct to NIC ports** (measured at the ports) | 2026-10-15 | 10 × 60 s | **86 µs** | — | **0.27 ms** (median) | kernel only |
 | **AF_XDP zero-copy forwarder** (own measurement: NIC arrival → copies handed to the NIC) | 2026-10-15 | 8 × 10 s | **~44 µs** | — | ~0.9 ms (median; 0.31–1.2) | 1 busy-polling core, ~6% used |
 | **AF_XDP + local-send thread**, cores 33/34, interrupts 35 (own measurement) | 2026-10-15 | 6 × 10 s | **~11.5 µs** | — | **~66 µs** (p99.9 ~100) | 2 busy-polling cores, 2.3 µs/shred |
+| **Receiver 10.182.192.17, kernel fan-out direct** (forwarder arrival → receiver, ±16 µs) | 2026-10-16 | 26 × 10 s | **~53 µs** | ~83 µs | **~93 µs** (p99.9 ~135) | kernel only |
+| **Receiver 10.182.192.17, AF_XDP** (same method) | 2026-10-16 | 16 × 10 s | ~137 µs | ~290 µs | ~1.1 ms (p99.9 ~1.5 ms) | 2 busy-polling cores |
 | Lab, 4 cores — _not representative_ | 2026-10-14 | 5 | 1.3 ms | 5.6 ms | 14.1 ms | 8.0 µs |
 
 Box level (since 2026-10-15) is the north star: first arrival on any of the
@@ -125,3 +127,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 |---|---|---|
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
 | [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven (p99 −55%); userspace fan-out variants; kernel fan-out: p99 −87% vs dedup + proxies |
+| [3](chapter-03-2026-10-16.md) | 2026-10-16 | Real-receiver measurement: kernel fan-out p50 ~53 / p99 ~93 µs end to end; AF_XDP fast to its send ring but slow to the wire (p99 ~1.1 ms) |
