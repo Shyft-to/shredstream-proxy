@@ -1652,6 +1652,7 @@ name = "fanout-bench"
 version = "0.2.13"
 dependencies = [
  "clap",
+ "libc",
  "serde",
  "serde_json",
 ]
