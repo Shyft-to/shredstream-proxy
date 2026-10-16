@@ -1,0 +1,19 @@
+[Unit]
+Description=Kernel shred fan-out (tc eBPF: dedup + send to every destination)
+Documentation=file:///opt/shred-fanout/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/shred-fanout/kfan.env
+ExecStart=/opt/shred-fanout/scripts/kfan.sh run ${PORTS} ${DESTS}
+# Also after a crash: detached, the proxies forward as before.
+ExecStopPost=/opt/shred-fanout/scripts/kfan.sh detach
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -10,6 +10,10 @@
 #   kfan.sh cost [SECONDS]       measured kernel CPU time per packet (default 10 s)
 #   kfan.sh watch DESTS          keep the table current: reload when bond ports
 #                                go up/down, re-resolve MACs every REFRESH_S (60)
+#   kfan.sh run PORTS DESTS      for a service: (re)attach, then watch, logging the
+#                                counters every LOG_S (60); detaches on SIGTERM
+#   kfan.sh check-dests DESTS    compare DESTS with the running proxies'
+#                                --dest-ip-ports / DEST_IP_PORTS
 #
 # Shares tc priority 7700 with dedup.sh: only one of the two can be attached.
 # Settings (environment): DEV (bond0), DROP_PORTS (up to 2, comma separated:
@@ -188,10 +192,39 @@ steer_off() {
     echo "restored rps on $DEV rx-0 and netdev_max_backlog"
 }
 
+# One line of counters with the change since the previous call (for the logs).
+log_counters() {
+    bpftool -j map dump name kfan_stats 2>/dev/null | python3 -c '
+import json, sys
+names = ["first", "dup", "short", "error", "no_dests", "sent", "refused", "ignored",
+         "carried", "carry_fail", "stamped", "stamp_skip"]
+show = ["first", "dup", "sent", "refused", "no_dests", "error", "short"]
+def num(v):
+    return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    sys.exit("counters unavailable")
+tot = {}
+for r in rows:
+    r = r.get("formatted", r)
+    tot[names[num(r["key"])]] = sum(num(v["value"]) for v in r["values"])
+prev_file = "/run/fanout-kfan.counters"
+try:
+    prev = json.load(open(prev_file))
+except (OSError, ValueError):
+    prev = {}
+json.dump(tot, open(prev_file, "w"))
+line = " ".join(f"{k}=+{tot.get(k, 0) - prev.get(k, 0)}" for k in show)
+bad = [k for k in ("refused", "no_dests", "error") if tot.get(k, 0) - prev.get(k, 0) > 0]
+print(("WARNING " + ",".join(bad) + " increasing | " if bad else "") + line)
+'
+}
+
 # Reloads the table whenever the set of active bond ports changes, and
 # re-resolves MACs every REFRESH_S seconds. Runs until interrupted.
 watch_ports() {
-    local dests=$1 last="" now t=0
+    local dests=$1 last="" now t=0 lt=0
     ours || { echo "kfan is not attached" >&2; exit 1; }
     while true; do
         now=$(for b in /sys/class/net/*/bonding; do ports_of "$(basename "$(dirname "$b")")"; done | sort | paste -sd,)
@@ -203,6 +236,11 @@ watch_ports() {
         fi
         sleep 1
         t=$((t + 1))
+        lt=$((lt + 1))
+        if [ "${LOG_S:-0}" -gt 0 ] && [ $lt -ge "$LOG_S" ]; then
+            echo "$(date +%T) $(log_counters)"
+            lt=0
+        fi
     done
 }
 
@@ -228,6 +266,64 @@ attach() {
         detach
         exit 1
     fi
+}
+
+# Service mode: always attach a freshly built program (so config changes take
+# effect), keep the table current, detach on stop. While detached the
+# proxies forward as before.
+run() {
+    [ $# -eq 2 ] || { echo "usage: kfan.sh run PORTS DESTS" >&2; exit 1; }
+    if ours; then
+        echo "replacing the attached kfan program"
+        tc filter del dev "$DEV" ingress pref "$PREF"
+    fi
+    attach "$1" "$2"
+    trap 'echo "stopping"; detach; exit 0' TERM INT
+    LOG_S=${LOG_S:-60}
+    log_counters >/dev/null || true
+    watch_ports "$2"
+}
+
+# Compares DESTS with the destinations of every running process that has
+# --dest-ip-ports or DEST_IP_PORTS (the proxies). Prints nothing else of
+# their command lines or environments.
+check_dests() {
+    python3 - "$1" <<'EOF'
+import os, sys
+
+want = {d for d in sys.argv[1].split(",") if d}
+found = 0
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        args = open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")
+        env = open(f"/proc/{pid}/environ", "rb").read().decode(errors="replace").split("\0")
+    except OSError:
+        continue
+    val = None
+    for i, a in enumerate(args):
+        if a == "--dest-ip-ports" and i + 1 < len(args):
+            val = args[i + 1]
+        elif a.startswith("--dest-ip-ports="):
+            val = a.split("=", 1)[1]
+    if val is None:
+        val = next((e.split("=", 1)[1] for e in env if e.startswith("DEST_IP_PORTS=")), None)
+    if val is None:
+        continue
+    found += 1
+    have = {d for d in val.split(",") if d}
+    name = os.path.basename(args[0]) if args and args[0] else "?"
+    only_proxy, only_kfan = sorted(have - want), sorted(want - have)
+    if not only_proxy and not only_kfan:
+        print(f"pid {pid} ({name}): same {len(have)} destinations")
+    else:
+        print(f"pid {pid} ({name}): DIFFERENT")
+        for d in only_proxy:
+            print(f"  only in the proxy: {d}")
+        for d in only_kfan:
+            print(f"  only in DESTS:     {d}")
+if not found:
+    print("no running process with --dest-ip-ports / DEST_IP_PORTS found")
+EOF
 }
 
 refresh() {
@@ -309,5 +405,7 @@ case "${1:-}" in
     status) status ;;
     cost) shift; cost "$@" ;;
     watch) shift; watch_ports "$@" ;;
-    *) sed -n '2,25p' "$0"; exit 1 ;;
+    run) shift; run "$@" ;;
+    check-dests) shift; check_dests "$@" ;;
+    *) sed -n '2,28p' "$0"; exit 1 ;;
 esac
