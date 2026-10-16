@@ -15,6 +15,9 @@
  * Usage: xskfwd --rx IF[,IF] --queue Q --dests FILE [--pin DIR] [--cpu N]
  *               [--copy] [--report SECS] [--label L] [--results FILE]
  *               [--local-cpu N]   (local sends on their own thread on cpu N)
+ *               [--busy-poll USECS] (run the queues' driver poll from this
+ *                                  thread: sends go out in the call that
+ *                                  queues them, not at the next interrupt)
  *               [--stamp-port P]  (copies to UDP port P start with "xskstamp" +
  *                                  arrival time, u64 LE CLOCK_MONOTONIC, for
  *                                  fanout-bench stamp-recv)
@@ -43,6 +46,13 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef SO_PREFER_BUSY_POLL
+#define SO_PREFER_BUSY_POLL 69
+#endif
+#ifndef SO_BUSY_POLL_BUDGET
+#define SO_BUSY_POLL_BUDGET 70
+#endif
 
 #include <bpf/bpf.h>
 #include <linux/bpf.h>
@@ -131,6 +141,7 @@ struct port {
 	uint32_t pool_n;
 	uint32_t tx_pending;
 	uint32_t slot;
+	uint64_t *sent_at;      /* per frame: arrival time of the shred it carries (| 1 = stamped copy) */
 };
 
 struct dest {
@@ -151,6 +162,7 @@ static volatile sig_atomic_t running = 1;
 static int local_fd = -1;
 static int nlocal;
 static unsigned stamp_port;
+static int busy_poll_us;
 
 static struct {
 	uint64_t shreds, copies, tx_full, local_fail, no_meta;
@@ -160,6 +172,7 @@ static struct {
 	uint64_t max_batch, stalls, max_stall_ns;
 	struct hist wait;        /* arrival -> handling starts (queueing before us) */
 	struct hist first, last; /* arrival -> first / last copy handed over */
+	struct hist done, done_stamp; /* arrival -> the NIC reported the copy sent (all / stamped copies) */
 } st;
 
 /*
@@ -368,6 +381,18 @@ static void setup_port(struct port *p, uint32_t queue, int copy, int socks_fd, i
 		p->pool[i] = (uint64_t)(NUM_FRAMES / 2 + i) * FRAME_SIZE;
 	p->pool_n = NUM_FRAMES / 2;
 
+	p->sent_at = calloc(NUM_FRAMES, sizeof(uint64_t));
+	if (!p->sent_at)
+		die("allocate send times");
+	if (busy_poll_us > 0) {
+		int fd = xsk_socket__fd(p->xsk), one = 1, budget = 64;
+
+		if (setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &one, sizeof(one)) ||
+		    setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us)) ||
+		    setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget)))
+			die("enable busy polling");
+	}
+
 	if (p->receive) {
 		uint32_t key = p->slot * QUEUES_PER_SLOT + queue;
 		int fd = xsk_socket__fd(p->xsk);
@@ -377,13 +402,14 @@ static void setup_port(struct port *p, uint32_t queue, int copy, int socks_fd, i
 		if (bpf_map_update_elem(slots_fd, &p->ifindex, &p->slot, BPF_ANY))
 			die("register port in xsk_slots");
 	}
-	fprintf(stderr, "xskfwd: %s queue %u: %s%s, %s mode\n", p->name, queue, p->receive ? "receive + " : "",
-		"send", copy ? "copy" : "zero-copy");
+	fprintf(stderr, "xskfwd: %s queue %u: %s%s, %s mode%s\n", p->name, queue, p->receive ? "receive + " : "",
+		"send", copy ? "copy" : "zero-copy", busy_poll_us > 0 ? ", busy polling" : "");
 }
 
 static void kick_tx(struct port *p)
 {
-	if (xsk_ring_prod__needs_wakeup(&p->tx)) {
+	/* Busy polling: the call itself runs the driver's poll, which sends. */
+	if (busy_poll_us > 0 || xsk_ring_prod__needs_wakeup(&p->tx)) {
 		sendto(xsk_socket__fd(p->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 		st.kicks++;
 	}
@@ -464,9 +490,17 @@ static int queue_local(const uint8_t *payload, uint32_t plen, uint64_t rx_ns)
 static void reclaim(struct port *p)
 {
 	uint32_t idx, n = xsk_ring_cons__peek(&p->comp, RING_SIZE, &idx);
+	uint64_t now = n ? now_ns() : 0;
 
-	for (uint32_t i = 0; i < n; i++)
-		p->pool[p->pool_n++] = *xsk_ring_cons__comp_addr(&p->comp, idx + i);
+	for (uint32_t i = 0; i < n; i++) {
+		uint64_t addr = *xsk_ring_cons__comp_addr(&p->comp, idx + i), *at = &p->sent_at[addr / FRAME_SIZE];
+
+		if (*at) {
+			h_add(*at & 1 ? &st.done_stamp : &st.done, now - (*at & ~1ull));
+			*at = 0;
+		}
+		p->pool[p->pool_n++] = addr;
+	}
 	if (n)
 		xsk_ring_cons__release(&p->comp, n);
 }
@@ -492,6 +526,7 @@ static int queue_copy(struct dest *d, const uint8_t *payload, uint32_t plen, uin
 			return -1;
 	}
 	addr = q->pool[--q->pool_n];
+	q->sent_at[addr / FRAME_SIZE] = rx_ns ? (rx_ns & ~1ull) | (uint64_t)!!d->stamp : 0;
 	buf = xsk_umem__get_data(q->area, addr);
 	memcpy(buf, d->hdr, d->hdr_len);
 	uint8_t *ip = buf + d->ip_off, *udp = ip + 20;
@@ -642,6 +677,13 @@ static void report(double secs, const char *label, const char *results, uint64_t
 			printf(" | local thread: p50 %.1f p99 %.1f p99.9 %.1f max %.1f us, preempted %lu",
 			       h_pct(&lq.out.lat, .5), h_pct(&lq.out.lat, .99), h_pct(&lq.out.lat, .999),
 			       lq.out.lat.max / 1000.0, (unsigned long)lq.out.invol);
+		/* The NIC's own view: when it reported each copy as sent. */
+		printf("\n   NIC reported sent (arrival -> done): p50 %.1f p90 %.1f p99 %.1f p99.9 %.1f max %.1f us",
+		       h_pct(&st.done, .5), h_pct(&st.done, .9), h_pct(&st.done, .99), h_pct(&st.done, .999),
+		       st.done.max / 1000.0);
+		if (st.done_stamp.n)
+			printf(" | stamped copy: p50 %.1f p99 %.1f us", h_pct(&st.done_stamp, .5),
+			       h_pct(&st.done_stamp, .99));
 		printf("\n");
 	} else {
 		printf("[%s] %.0fs: %lu shreds, no timed samples (no arrival metadata: %lu)\n", label, secs,
@@ -665,6 +707,9 @@ static void report(double secs, const char *label, const char *results, uint64_t
 			summary_json(f, &st.first);
 			fprintf(f, ",\"wait\":");
 			summary_json(f, &st.wait);
+			fprintf(f, ",\"nic_done\":");
+			summary_json(f, &st.done);
+			fprintf(f, ",\"busy_poll_us\":%d", busy_poll_us);
 			if (lq.on) {
 				fprintf(f, ",\"local\":");
 				summary_json(f, &lq.out.lat);
@@ -689,6 +734,7 @@ int main(int argc, char **argv)
 		{"report", required_argument, 0, 'R'}, {"label", required_argument, 0, 'l'},
 		{"results", required_argument, 0, 'o'}, {"local-cpu", required_argument, 0, 'L'},
 		{"stamp-port", required_argument, 0, 'S'},
+		{"busy-poll", required_argument, 0, 'B'},
 		{0, 0, 0, 0},
 	};
 	int o;
@@ -706,6 +752,7 @@ int main(int argc, char **argv)
 		case 'o': results = optarg; break;
 		case 'L': local_cpu = atoi(optarg); break;
 		case 'S': stamp_port = (unsigned)atoi(optarg); break;
+		case 'B': busy_poll_us = atoi(optarg); break;
 		default: goto usage;
 		}
 	}
@@ -772,7 +819,8 @@ int main(int argc, char **argv)
 				continue;
 			n = xsk_ring_cons__peek(&pp->rx, RX_BATCH, &idx);
 			if (!n) {
-				if (xsk_ring_prod__needs_wakeup(&pp->fill))
+				/* Busy polling: this call runs the driver's receive poll. */
+				if (busy_poll_us > 0 || xsk_ring_prod__needs_wakeup(&pp->fill))
 					recvfrom(xsk_socket__fd(pp->xsk), NULL, 0, MSG_DONTWAIT, NULL, NULL);
 				continue;
 			}
@@ -831,7 +879,7 @@ int main(int argc, char **argv)
 usage:
 	fprintf(stderr, "usage: %s --rx IF[,IF] --queue Q --dests FILE [--pin DIR] [--cpu N] [--copy]\n"
 			"       [--report SECS] [--label L] [--results FILE] [--local-cpu N]\n"
-			"       [--stamp-port P]\n",
+			"       [--stamp-port P] [--busy-poll USECS]\n",
 		argv[0]);
 	return 2;
 }
