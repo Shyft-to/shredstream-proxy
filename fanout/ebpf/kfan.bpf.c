@@ -66,6 +66,22 @@
 #define STAMP_XDP_MAGIC 0x737064786e61666bULL /* "kfanxdps": the driver-level time */
 #define XDP_META_MAGIC 0x31706d7473706478ULL  /* "xdpstmp1", written by xdpstamp.bpf.c */
 
+/*
+ * Optional -DLAT_HIST=1|2: latency histograms in kfan_lat, measured from the
+ * arrival time xdpstamp.bpf.c wrote at the NIC driver to the moment each copy
+ * was handed to the outgoing device (bpf_clone_redirect returned). Series 0:
+ * first copy of each shred, 1: last copy (fan-out completion); with 2, also
+ * 2 + i: destination i of the table. Read by `kfan.sh latency`. Shreds without
+ * a driver-level time are counted (STAT_LAT_NOXDP) and left out.
+ */
+#ifndef LAT_HIST
+#define LAT_HIST 0
+#endif
+#define LAT_FINE 1024                  /* 1 µs buckets up to 1024 µs, */
+#define LAT_BUCKETS (LAT_FINE + 16)    /* then 1 ms buckets up to ~17 ms */
+#define LAT_FIRST 0
+#define LAT_LAST 1
+
 #ifndef GROUPS
 #define GROUPS 1
 #endif
@@ -125,6 +141,7 @@ enum {
 	STAT_CARRY_FAIL, /* carrier copies the kernel refused */
 	STAT_STAMPED,    /* copies to STAMP_PORT stamped */
 	STAT_STAMP_NOXDP, /* of which without a driver-level time (this program's time used) */
+	STAT_LAT_NOXDP,  /* LAT_HIST: shreds without a driver-level time, not in the histograms */
 	STAT_MAX,
 };
 
@@ -143,6 +160,28 @@ static __always_inline void count(__u32 i)
 		(*v)++;
 }
 
+/* Series 0/1 always; one per destination of group 0 with LAT_HIST=2. */
+#define LAT_SERIES (LAT_HIST >= 2 ? 2 + MAX_PER_GROUP : 2)
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, LAT_HIST ? LAT_SERIES * LAT_BUCKETS : 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} kfan_lat SEC(".maps");
+
+static __always_inline void lat_add(__u32 series, __u64 ns)
+{
+	__u64 us = ns / 1000;
+	__u32 key = series * LAT_BUCKETS +
+		    (us < LAT_FINE ? (__u32)us
+				   : LAT_FINE + ((us - LAT_FINE) / 1000 < 15 ? (__u32)((us - LAT_FINE) / 1000) : 15));
+	__u64 *v = bpf_map_lookup_elem(&kfan_lat, &key);
+
+	if (v)
+		__sync_fetch_and_add(v, 1);
+}
+
 static __always_inline int watched(__u16 port)
 {
 	return port == PORT_A || (PORT_B && port == PORT_B) ||
@@ -152,10 +191,12 @@ static __always_inline int watched(__u16 port)
 /* Sends the shred to every destination of group g. Rewrites headers in place
  * (UDP source port and checksum are set by the caller). */
 static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
-				       __be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns, __u64 magic)
+				       __be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns, __u64 magic,
+				       __u64 lat_rx)
 {
 	struct dest *d;
 	__u16 cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
+	__u64 last = 0;
 	__u32 i;
 
 	for (i = 0; i < MAX_PER_GROUP; i++) {
@@ -201,13 +242,21 @@ static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
 			count(STAT_STAMPED);
 			if (magic != STAMP_XDP_MAGIC)
 				count(STAT_STAMP_NOXDP);
-			continue;
-		}
-		if (bpf_clone_redirect(skb, d->ifindex, 0))
+		} else if (bpf_clone_redirect(skb, d->ifindex, 0)) {
 			count(STAT_CLONE_FAIL);
-		else
+		} else {
 			count(STAT_CLONED);
+		}
+		if (LAT_HIST && lat_rx) {
+			last = bpf_ktime_get_ns() - lat_rx;
+			if (i == 0)
+				lat_add(LAT_FIRST, last);
+			if (LAT_HIST >= 2)
+				lat_add(2 + i, last);
+		}
 	}
+	if (LAT_HIST && lat_rx && last)
+		lat_add(LAT_LAST, last);
 }
 
 SEC("tc")
@@ -226,7 +275,7 @@ int kfan(struct __sk_buff *skb)
 
 	if (skb->protocol != bpf_htons(ETH_P_IP))
 		return TC_ACT_OK;
-	if (STAMP_PORT) {
+	if (STAMP_PORT || LAT_HIST) {
 		/* Arrival time from the driver level, if xdpstamp is loaded. */
 		void *data = (void *)(long)skb->data;
 		__u64 *meta = (void *)(long)skb->data_meta;
@@ -313,7 +362,13 @@ int kfan(struct __sk_buff *skb)
 	sport = udp.dest;
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, source), &sport, sizeof(sport), 0);
 	bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, check), &no_csum, sizeof(no_csum), 0);
-	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns, magic);
+	/* Histograms: driver-level arrival times only, and only where the
+	 * shred arrived (group 0; carriers start later on another CPU). */
+	__u64 lat_rx = LAT_HIST && g == 0 && magic == STAMP_XDP_MAGIC ? rx_ns : 0;
+
+	if (LAT_HIST && g == 0 && !lat_rx)
+		count(STAT_LAT_NOXDP);
+	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns, magic, lat_rx);
 	return TC_ACT_SHOT;
 }
 

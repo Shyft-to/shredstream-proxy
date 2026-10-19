@@ -1,6 +1,6 @@
 # Fan-out latency — status
 
-_Updated 2026-10-16_
+_Updated 2026-10-19_
 
 ## Goal
 
@@ -134,3 +134,4 @@ candidates are now tested on production traffic with alternating A/B runs.
 | [1](chapter-01-2026-10-14.md) | 2026-10-14 | North star defined, production baseline, profile of the forwarder, queueing identified |
 | [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven (p99 −55%); userspace fan-out variants; kernel fan-out: p99 −87% vs dedup + proxies |
 | [3](chapter-03-2026-10-16.md) | 2026-10-16 | Real-receiver measurement: kernel fan-out p50 ~53 / p99 ~93 µs end to end; AF_XDP fast to its send ring but slow to the wire (p99 ~1.1 ms) |
+| [4](chapter-04-2026-10-19.md) | 2026-10-19 | Local-delivery fix tested end to end; capture-free exact box latency (`probe.sh latency`: NIC-driver stamp → in-kernel histograms) |

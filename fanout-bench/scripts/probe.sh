@@ -7,6 +7,10 @@
 #   probe.sh box PORTS [SECONDS] [LABEL]      box-level north star across the forwarders on PORTS
 #                                             (comma separated); results in box-results.jsonl
 #   probe.sh corpus PORT [SECONDS] [FILE]     record full ingress packets to replay in the test bed
+#   probe.sh latency [SECONDS] [LABEL]        box-level latency of the kernel fan-out without any
+#                                             capture: arrival at the NIC driver -> each copy handed
+#                                             to the NIC (needs xdpstamp.sh + kfan LAT_HIST); results
+#                                             in box-results.jsonl (source kfan-hist)
 #
 # Settings (environment):
 #   IN_IF    interface that carries ingress and network egress  (bond0)
@@ -233,9 +237,19 @@ corpus() {
     ls -lh "$file"
 }
 
+# Exact and capture-free: reads the kernel fan-out's own histograms (kfan.sh latency).
+latency() {
+    local secs=${1:-60} label=${2:-kfan-latency} kfan
+    kfan=${KFAN:-/opt/shred-fanout/scripts/kfan.sh}
+    [ -x "$kfan" ] || kfan="$(cd "$(dirname "$0")/../.." && pwd)/fanout/scripts/kfan.sh"
+    mkdir -p "$OUT"
+    "$kfan" latency "$secs" "$label" "$OUT/box-results.jsonl" | tee "$OUT/$label-$(date +%Y%m%d-%H%M%S).txt"
+}
+
 case "${1:-}" in
     measure) shift; measure "$@" ;;
     box) shift; box "$@" ;;
     corpus) shift; corpus "$@" ;;
-    *) sed -n '2,16p' "$0"; exit 1 ;;
+    latency) shift; latency "$@" ;;
+    *) sed -n '2,20p' "$0"; exit 1 ;;
 esac

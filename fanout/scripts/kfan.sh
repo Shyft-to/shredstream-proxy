@@ -14,6 +14,9 @@
 #                                counters every LOG_S (60); detaches on SIGTERM
 #   kfan.sh check-dests DESTS    compare DESTS with the running proxies'
 #                                --dest-ip-ports / DEST_IP_PORTS
+#   kfan.sh latency [SECONDS] [LABEL] [RESULTS]
+#                                arrival at the NIC driver -> each copy handed to the
+#                                NIC, over a window (needs LAT_HIST and xdpstamp.sh)
 #
 # Shares tc priority 7700 with dedup.sh: only one of the two can be attached.
 # Settings (environment): DEV (bond0), DROP_PORTS (up to 2, comma separated:
@@ -27,6 +30,8 @@
 #   STAMP_PORT=p: copies to destinations with UDP port p (fanout-bench
 #   stamp-recv receivers) carry the arrival time (driver level if
 #   xdpstamp.sh is attached); see kfan.bpf.c.
+#   LAT_HIST=1|2: in-kernel latency histograms for `latency` (1: first and last
+#   copy; 2: also per destination). Needs xdpstamp.sh attached.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,6 +41,7 @@ DEV=${DEV:-bond0}
 DROP_PORTS=${DROP_PORTS:-}
 DIRECT=${DIRECT:-0}
 STAMP_PORT=${STAMP_PORT:-}
+LAT_HIST=${LAT_HIST:-}
 KFAN_GROUPS=${KFAN_GROUPS:-1}
 KFAN_CPUS=${KFAN_CPUS:-}
 PREF=7700
@@ -65,6 +71,10 @@ build() {
     if [ -n "$STAMP_PORT" ]; then
         [[ "$STAMP_PORT" =~ ^[0-9]+$ ]] || { echo "bad STAMP_PORT: $STAMP_PORT" >&2; exit 1; }
         defs+=("-DSTAMP_PORT=$STAMP_PORT")
+    fi
+    if [ -n "$LAT_HIST" ]; then
+        [[ "$LAT_HIST" =~ ^[012]$ ]] || { echo "LAT_HIST must be 0, 1 or 2" >&2; exit 1; }
+        defs+=("-DLAT_HIST=$LAT_HIST")
     fi
     clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
         "${defs[@]}" -c "$SRC" -o "$OBJ"
@@ -232,7 +242,7 @@ log_counters() {
     bpftool -j map dump name kfan_stats 2>/dev/null | python3 -c '
 import json, sys
 names = ["first", "dup", "short", "error", "no_dests", "sent", "refused", "ignored",
-         "carried", "carry_fail", "stamped", "stamp_noxdp"]
+         "carried", "carry_fail", "stamped", "stamp_noxdp", "lat_noxdp"]
 show = ["first", "dup", "sent", "refused", "no_dests", "error", "short"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
@@ -366,6 +376,11 @@ if not found:
 EOF
 }
 
+latency() {
+    ours || { echo "kfan is not attached" >&2; exit 1; }
+    python3 "$DIR/kfan_latency.py" "$@"
+}
+
 refresh() {
     ours || { echo "kfan is not attached" >&2; exit 1; }
     load_dests "$1"
@@ -387,7 +402,8 @@ counters() {
 import json, sys
 names = ["first copies", "duplicates (dropped)", "too short (passed)", "dedup error (passed)",
          "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)",
-         "carriers to other CPUs", "carriers refused", "stamped copies", "stamped without XDP time"]
+         "carriers to other CPUs", "carriers refused", "stamped copies", "stamped without XDP time",
+         "latency: no XDP time (left out)"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:
@@ -448,5 +464,6 @@ case "${1:-}" in
     watch) shift; watch_ports "$@" ;;
     run) shift; run "$@" ;;
     check-dests) shift; check_dests "$@" ;;
+    latency) shift; latency "$@" ;;
     *) sed -n '2,29p' "$0"; exit 1 ;;
 esac
