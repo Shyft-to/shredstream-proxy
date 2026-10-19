@@ -87,6 +87,11 @@ hex_be16() { printf '%02x %02x' $(($1 >> 8 & 255)) $(($1 & 255)); }
 
 hex_le16() { printf '%02x %02x' $(($1 & 255)) $(($1 >> 8 & 255)); }
 
+# Ports listed here (one per line) are left out, as if down: xdpstamp.sh puts
+# a port here while it loads or unloads XDP on it, which resets that port's
+# queues without the bond noticing (direct copies to it would be refused).
+EXCLUDE=/run/fanout-kfan.exclude
+
 # Active member ports of a bond (in the active 802.3ad aggregator, link up),
 # or the device itself if it is not a bond.
 ports_of() {
@@ -99,6 +104,7 @@ ports_of() {
     for s in $(cat "/sys/class/net/$dev/bonding/slaves"); do
         [ "$(cat "/sys/class/net/$s/operstate")" = up ] || continue
         [ "$(cat "/sys/class/net/$s/bonding_slave/mii_status" 2>/dev/null || echo up)" = up ] || continue
+        if [ -e "$EXCLUDE" ] && grep -qx "$s" "$EXCLUDE"; then continue; fi
         if [ -n "$agg" ] && [ -e "/sys/class/net/$s/bonding_slave/ad_aggregator_id" ]; then
             [ "$(cat "/sys/class/net/$s/bonding_slave/ad_aggregator_id")" = "$agg" ] || continue
         fi

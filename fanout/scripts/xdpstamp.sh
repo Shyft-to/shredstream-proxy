@@ -5,9 +5,11 @@
 #
 # Usage:
 #   xdpstamp.sh attach PORTS    build for PORTS and load on each member port of DEV,
-#                               one at a time. Loading XDP briefly pauses traffic on
-#                               that port; the bond keeps the other one carrying it.
-#   xdpstamp.sh detach          unload (one port at a time, same brief pause)
+#                               one at a time. Loading XDP resets that port's queues
+#                               for a moment (the bond does not notice): if the kernel
+#                               fan-out service is running, its copies are first moved
+#                               to the other port (see kfan.sh EXCLUDE), then back.
+#   xdpstamp.sh detach          unload (one port at a time, same handling)
 #   xdpstamp.sh status          where it is loaded
 #
 # Then run the kernel fan-out with STAMP_PORT set and the receivers' ip:STAMP_PORT
@@ -30,6 +32,30 @@ ifaces() {
 }
 
 loaded_on() { ip -d link show dev "$1" | grep -q 'prog/xdp'; }
+
+EXCLUDE=/run/fanout-kfan.exclude
+# The fan-out service's watch loop re-checks the ports every second.
+kfan_running() { systemctl is-active --quiet shred-kfan 2>/dev/null; }
+
+# Moves the fan-out's copies off IFACE while CMD runs on it, then back.
+off_port() { # IFACE CMD...
+    local iface=$1
+    shift
+    if kfan_running; then
+        echo "$iface" >"$EXCLUDE"
+        echo "  kernel fan-out: copies moved off $iface"
+        sleep 3
+    fi
+    "$@"
+    echo "  waiting for the link"
+    wait_link "$iface" || true
+    sleep 2
+    if [ -e "$EXCLUDE" ]; then
+        rm -f "$EXCLUDE"
+        echo "  kernel fan-out: $iface back in use"
+        sleep 3
+    fi
+}
 
 wait_link() { # IFACE: wait until it is up again (and back in the bond)
     local i
@@ -69,10 +95,8 @@ attach() {
     done
     for iface in $(ifaces); do
         echo "--- $iface"
-        ip link set dev "$iface" xdpdrv obj "$OBJ" sec xdp
-        echo "  loaded (native); waiting for the link"
-        wait_link "$iface" || true
-        sleep 2
+        off_port "$iface" ip link set dev "$iface" xdpdrv obj "$OBJ" sec xdp
+        echo "  loaded (native)"
     done
     echo "stamping UDP $1 at the driver on: $(ifaces | paste -sd' ')"
 }
@@ -82,9 +106,7 @@ detach() {
     for iface in $(ifaces); do
         loaded_on "$iface" || continue
         echo "--- $iface: unloading"
-        ip link set dev "$iface" xdpdrv off
-        wait_link "$iface" || true
-        sleep 2
+        off_port "$iface" ip link set dev "$iface" xdpdrv off
     done
     echo "detached"
 }
@@ -104,5 +126,5 @@ case "${1:-}" in
     attach) shift; attach "$@" ;;
     detach) detach ;;
     status) status ;;
-    *) sed -n '2,17p' "$0"; exit 1 ;;
+    *) sed -n '2,19p' "$0"; exit 1 ;;
 esac
