@@ -292,7 +292,7 @@ int kfan(struct __sk_buff *skb)
 			checked = meta[0] == XDP_META_CHECKED;
 			rx_ns = meta[1];
 			magic = STAMP_XDP_MAGIC;
-		} else if (STAMP_PORT || LAT_HIST) {
+		} else if (STAMP_PORT != 0 || LAT_HIST != 0) {
 			rx_ns = bpf_ktime_get_ns();
 		}
 	}
