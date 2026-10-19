@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Kernel fan-out latency over a window, from kfan's in-kernel histograms.
 
-Measured from the shred's arrival at the NIC driver (xdpstamp.bpf.c) to the
-moment each copy was handed to the outgoing device, for every shred, with no
-packet capture running. Needs kfan built with LAT_HIST (see kfan.bpf.c).
+Measured to the moment each copy was handed to the outgoing device, for every
+shred, with no packet capture running, from two starting points:
+  low:  when the NIC driver picked the shred up (xdpstamp.bpf.c). Misses any
+        time it waited in the NIC's receive ring before that.
+  high: when that CPU last went from idle to busy with shreds: a shred picked
+        up while the CPU was busy may have waited in the ring since then.
+The true value lies between. Needs kfan built with LAT_HIST (see kfan.bpf.c).
 
 Usage: kfan_latency.py [SECONDS] [LABEL] [RESULTS_JSONL]   (run as root)
 """
@@ -16,7 +20,8 @@ import time
 LAT_FINE = 1024          # must match kfan.bpf.c
 LAT_BUCKETS = LAT_FINE + 16
 STAT_FIRST, STAT_SENT, STAT_LAT_NOXDP = 0, 5, 12
-SERIES_FIRST, SERIES_LAST, SERIES_WAIT, SERIES_DEST0 = 0, 1, 2, 3
+SERIES_FIRST, SERIES_LAST, SERIES_WAIT = 0, 1, 2
+SERIES_FIRST_UB, SERIES_LAST_UB, SERIES_WAIT_UB, SERIES_DEST0 = 3, 4, 5, 6
 
 
 def num(v):
@@ -82,6 +87,14 @@ def summary(counts):
             "p999_us": pct(.999), "max_us": bucket_us(top)}
 
 
+def span(name, lo, hi):
+    """One row: each percentile as low..high."""
+    cells = "  ".join(f"{k} {lo[f]:6.1f}..{hi[f]:<6.1f}" for k, f in
+                      (("p50", "p50_us"), ("p90", "p90_us"), ("p99", "p99_us"), ("p99.9", "p999_us"),
+                       ("max", "max_us")))
+    return f"  {name:<22} {cells}"
+
+
 def line(name, s):
     return (f"  {name:<40} p50 {s['p50_us']:8.1f}  p90 {s['p90_us']:8.1f}  p99 {s['p99_us']:8.1f}  "
             f"p99.9 {s['p999_us']:8.1f}  max {s['max_us']:8.1f}  (n={s['count']})")
@@ -104,6 +117,8 @@ def main():
             for s in range(series)]
     first, last = summary(hist[SERIES_FIRST]), summary(hist[SERIES_LAST])
     wait = summary(hist[SERIES_WAIT])
+    first_ub, last_ub = summary(hist[SERIES_FIRST_UB]), summary(hist[SERIES_LAST_UB])
+    wait_ub = summary(hist[SERIES_WAIT_UB])
     d_first = sb.get(STAT_FIRST, 0) - sa.get(STAT_FIRST, 0)
     d_sent = sb.get(STAT_SENT, 0) - sa.get(STAT_SENT, 0)
     d_noxdp = sb.get(STAT_LAT_NOXDP, 0) - sa.get(STAT_LAT_NOXDP, 0)
@@ -111,8 +126,18 @@ def main():
         sys.exit(f"no samples in {secs:.0f}s ({d_first} shreds, {d_noxdp} without a driver-level time: "
                  "is xdpstamp.sh attached?)")
 
-    print(f"NORTH STAR  p99 fan-out completion: {last['p99_us']:.1f} us   "
-          "(arrival at the NIC driver -> copy handed to the NIC; no capture)")
+    if last_ub:
+        print(f"NORTH STAR  p99 fan-out completion: {last['p99_us']:.1f} .. {last_ub['p99_us']:.1f} us   "
+              "(true value between: low = from driver pickup, high = from when the CPU became busy)")
+        print("range (low..high, us)")
+        print(span("completion", last, last_ub))
+        print(span("first dest", first, first_ub))
+        if wait and wait_ub:
+            print(span("waiting", wait, wait_ub))
+        print("from driver pickup (low end)")
+    else:
+        print(f"NORTH STAR  p99 fan-out completion: {last['p99_us']:.1f} us   "
+              "(from driver pickup; no capture)")
     print(line("completion (arrival -> last dest)", last))
     print(line("first dest (arrival -> first dest)", first))
     if wait:
@@ -136,6 +161,7 @@ def main():
                "meta": {"source": "kfan-hist", "window_s": str(secs)}, "capture_seconds": secs,
                "eligible_shreds": last["count"], "copies_per_shred": round(sent_per, 3),
                "no_xdp_time": d_noxdp, "completion": last, "first_dest": first, "wait": wait,
+               "completion_high": last_ub, "first_dest_high": first_ub, "wait_high": wait_ub,
                "per_dest": per_dest}
         with open(results, "a") as f:
             f.write(json.dumps(row) + "\n")

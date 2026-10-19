@@ -73,9 +73,17 @@
  * was handed to the outgoing device (bpf_clone_redirect returned). Series 0:
  * first copy of each shred, 1: last copy (fan-out completion), 2: wait before
  * this program started on the shred (driver -> packet buffer, bond, and any
- * queueing behind earlier packets on the CPU); with 2, also 3 + i:
+ * queueing behind earlier packets on the CPU); with 2, also LAT_DEST0 + i:
  * destination i of the table. Read by `kfan.sh latency`. Shreds without a
  * driver-level time are counted (STAT_LAT_NOXDP) and left out.
+ *
+ * The driver-level time is when the driver picked the packet up, so time spent
+ * in the NIC's receive ring before that is not seen (the NIC cannot timestamp
+ * every packet). Series 3-5 repeat 0-2 from an upper bound instead: when this
+ * CPU last went from idle to busy with shreds (a shred picked up while the CPU
+ * was busy may have waited in the ring since then, not longer). A pickup more
+ * than BUSY_GAP_NS after the CPU finished its last fan-out counts as idle.
+ * The true values lie between the two.
  */
 #ifndef LAT_HIST
 #define LAT_HIST 0
@@ -85,7 +93,11 @@
 #define LAT_FIRST 0
 #define LAT_LAST 1
 #define LAT_WAIT 2
-#define LAT_DEST0 3
+#define LAT_FIRST_UB 3
+#define LAT_LAST_UB 4
+#define LAT_WAIT_UB 5
+#define LAT_DEST0 6
+#define BUSY_GAP_NS 10000
 
 #ifndef GROUPS
 #define GROUPS 1
@@ -166,7 +178,20 @@ static __always_inline void count(__u32 i)
 		(*v)++;
 }
 
-/* Series 0-2 always; one per destination of group 0 with LAT_HIST=2. */
+/* Per CPU: the current busy stretch (for the upper-bound series). */
+struct busy {
+	__u64 start; /* driver pickup of the first shred after the CPU was idle */
+	__u64 end;   /* last copy of the most recent fan-out */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct busy);
+} kfan_busy SEC(".maps");
+
+/* Series 0-5 always; one per destination of group 0 with LAT_HIST=2. */
 #define LAT_SERIES (LAT_HIST >= 2 ? LAT_DEST0 + MAX_PER_GROUP : LAT_DEST0)
 
 struct {
@@ -196,9 +221,10 @@ static __always_inline int watched(__u16 port)
 
 /* Sends the shred to every destination of group g. Rewrites headers in place
  * (UDP source port and checksum are set by the caller). */
-static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
-				       __be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns, __u64 magic,
-				       __u64 lat_rx)
+/* Returns the time from lat_rx to the last copy (0 without histograms). */
+static __always_inline __u64 send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
+					__be32 cur_saddr, __be32 cur_daddr, __u64 rx_ns, __u64 magic,
+					__u64 lat_rx, __u64 ub_extra)
 {
 	struct dest *d;
 	__u16 cur_vlan = skb->vlan_present ? skb->vlan_tci : 0;
@@ -255,14 +281,19 @@ static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
 		}
 		if (LAT_HIST && lat_rx) {
 			last = bpf_ktime_get_ns() - lat_rx;
-			if (i == 0)
+			if (i == 0) {
 				lat_add(LAT_FIRST, last);
+				lat_add(LAT_FIRST_UB, last + ub_extra);
+			}
 			if (LAT_HIST >= 2)
 				lat_add(LAT_DEST0 + i, last);
 		}
 	}
-	if (LAT_HIST && lat_rx && last)
+	if (LAT_HIST && lat_rx && last) {
 		lat_add(LAT_LAST, last);
+		lat_add(LAT_LAST_UB, last + ub_extra);
+	}
+	return last;
 }
 
 SEC("tc")
@@ -382,9 +413,22 @@ int kfan(struct __sk_buff *skb)
 
 	if (LAT_HIST && g == 0 && !lat_rx)
 		count(STAT_LAT_NOXDP);
-	if (LAT_HIST && lat_rx)
+	__u64 ub_extra = 0; /* lat_rx minus the upper-bound arrival (CPU busy since) */
+	struct busy *b = LAT_HIST && lat_rx ? bpf_map_lookup_elem(&kfan_busy, &zero) : 0;
+
+	if (LAT_HIST && lat_rx) {
 		lat_add(LAT_WAIT, start_ns - lat_rx);
-	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns, magic, lat_rx);
+		if (b) {
+			if (!b->end || lat_rx > b->end + BUSY_GAP_NS || lat_rx < b->start)
+				b->start = lat_rx; /* the CPU was idle: a new busy stretch */
+			ub_extra = lat_rx - b->start;
+			lat_add(LAT_WAIT_UB, start_ns - b->start);
+		}
+	}
+	__u64 last = send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns, magic, lat_rx, ub_extra);
+
+	if (b && last)
+		b->end = lat_rx + last;
 	return TC_ACT_SHOT;
 }
 
