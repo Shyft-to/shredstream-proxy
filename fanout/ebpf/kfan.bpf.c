@@ -65,6 +65,7 @@
 #define STAMP_MAGIC 0x706d74736e61666bULL     /* "kfanstmp": this program's time */
 #define STAMP_XDP_MAGIC 0x737064786e61666bULL /* "kfanxdps": the driver-level time */
 #define XDP_META_MAGIC 0x31706d7473706478ULL  /* "xdpstmp1", written by xdpstamp.bpf.c */
+#define XDP_META_CHECKED 0x32706d7473706478ULL /* "xdpstmp2": also deduplicated there (first copy) */
 
 /*
  * Optional -DLAT_HIST=1|2: latency histograms in kfan_lat, measured from the
@@ -146,6 +147,7 @@ enum {
 	STAT_STAMPED,    /* copies to STAMP_PORT stamped */
 	STAT_STAMP_NOXDP, /* of which without a driver-level time (this program's time used) */
 	STAT_LAT_NOXDP,  /* LAT_HIST: shreds without a driver-level time, not in the histograms */
+	STAT_XDP_CHECKED, /* first copies already deduplicated by xdpstamp (own check skipped) */
 	STAT_MAX,
 };
 
@@ -271,6 +273,7 @@ int kfan(struct __sk_buff *skb)
 	struct shred_key key;
 	struct dest *d;
 	__u64 rx_ns = 0, magic = STAMP_MAGIC;
+	int checked = 0; /* xdpstamp already dropped this shred's duplicates */
 	__u64 start_ns = LAT_HIST ? bpf_ktime_get_ns() : 0; /* this program started on the packet */
 	__u8 first_byte;
 	__u32 ihl, l4, g = 0, zero = 0;
@@ -280,15 +283,16 @@ int kfan(struct __sk_buff *skb)
 
 	if (skb->protocol != bpf_htons(ETH_P_IP))
 		return TC_ACT_OK;
-	if (STAMP_PORT || LAT_HIST) {
-		/* Arrival time from the driver level, if xdpstamp is loaded. */
+	{
+		/* Written by xdpstamp at the NIC driver, if it is loaded. */
 		void *data = (void *)(long)skb->data;
 		__u64 *meta = (void *)(long)skb->data_meta;
 
-		if ((void *)(meta + 2) <= data && meta[0] == XDP_META_MAGIC) {
+		if ((void *)(meta + 2) <= data && (meta[0] == XDP_META_MAGIC || meta[0] == XDP_META_CHECKED)) {
+			checked = meta[0] == XDP_META_CHECKED;
 			rx_ns = meta[1];
 			magic = STAMP_XDP_MAGIC;
-		} else {
+		} else if (STAMP_PORT || LAT_HIST) {
 			rx_ns = bpf_ktime_get_ns();
 		}
 	}
@@ -318,18 +322,23 @@ int kfan(struct __sk_buff *skb)
 		if (g >= MAX_GROUPS)
 			return TC_ACT_SHOT;
 	} else {
-		if (bpf_skb_load_bytes(skb, l4 + sizeof(udp), &key, sizeof(key))) {
-			count(STAT_SHORT);
-			return TC_ACT_OK;
-		}
-		ret = bpf_map_update_elem(&kfan_seen, &key, &port, BPF_NOEXIST);
-		if (ret == -EEXIST) {
-			count(STAT_DUPLICATE);
-			return TC_ACT_SHOT;
-		}
-		if (ret) {
-			count(STAT_ERROR);
-			return TC_ACT_OK;
+		if (checked) {
+			/* First copy: xdpstamp dropped the others already. */
+			count(STAT_XDP_CHECKED);
+		} else {
+			if (bpf_skb_load_bytes(skb, l4 + sizeof(udp), &key, sizeof(key))) {
+				count(STAT_SHORT);
+				return TC_ACT_OK;
+			}
+			ret = bpf_map_update_elem(&kfan_seen, &key, &port, BPF_NOEXIST);
+			if (ret == -EEXIST) {
+				count(STAT_DUPLICATE);
+				return TC_ACT_SHOT;
+			}
+			if (ret) {
+				count(STAT_ERROR);
+				return TC_ACT_OK;
+			}
 		}
 		count(STAT_FIRST);
 

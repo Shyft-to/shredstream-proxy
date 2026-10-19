@@ -248,7 +248,7 @@ log_counters() {
     bpftool -j map dump name kfan_stats 2>/dev/null | python3 -c '
 import json, sys
 names = ["first", "dup", "short", "error", "no_dests", "sent", "refused", "ignored",
-         "carried", "carry_fail", "stamped", "stamp_noxdp", "lat_noxdp"]
+         "carried", "carry_fail", "stamped", "stamp_noxdp", "lat_noxdp", "xdp_checked"]
 show = ["first", "dup", "sent", "refused", "no_dests", "error", "short"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
@@ -265,6 +265,18 @@ try:
     prev = json.load(open(prev_file))
 except (OSError, ValueError):
     prev = {}
+# Duplicates dropped earlier, at the NIC driver, by xdpstamp (if loaded with DEDUP=1).
+import subprocess
+try:
+    xs = json.loads(subprocess.run(["bpftool", "-j", "map", "dump", "name", "xdps_stats"],
+                                   capture_output=True, text=True).stdout or "[]")
+    for r in xs:
+        if num(r["key"]) == 2:
+            tot["xdp_dup"] = sum(num(v["value"]) for v in r["values"])
+except (ValueError, KeyError):
+    pass
+if tot.get("xdp_checked", 0) or "xdp_dup" in tot:
+    show[2:2] = ["xdp_dup", "xdp_checked"]
 json.dump(tot, open(prev_file, "w"))
 line = " ".join(f"{k}=+{tot.get(k, 0) - prev.get(k, 0)}" for k in show)
 bad = [k for k in ("refused", "no_dests", "error") if tot.get(k, 0) - prev.get(k, 0) > 0]
@@ -409,7 +421,7 @@ import json, sys
 names = ["first copies", "duplicates (dropped)", "too short (passed)", "dedup error (passed)",
          "no destinations (passed)", "copies sent", "copies refused", "ignored port (dropped)",
          "carriers to other CPUs", "carriers refused", "stamped copies", "stamped without XDP time",
-         "latency: no XDP time (left out)"]
+         "latency: no XDP time (left out)", "first copies deduplicated by XDP"]
 def num(v):
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:
