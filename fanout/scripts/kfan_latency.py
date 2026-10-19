@@ -16,6 +16,7 @@ import time
 LAT_FINE = 1024          # must match kfan.bpf.c
 LAT_BUCKETS = LAT_FINE + 16
 STAT_FIRST, STAT_SENT, STAT_LAT_NOXDP = 0, 5, 12
+SERIES_FIRST, SERIES_LAST, SERIES_WAIT, SERIES_DEST0 = 0, 1, 2, 3
 
 
 def num(v):
@@ -92,7 +93,7 @@ def main():
     results = sys.argv[3] if len(sys.argv) > 3 else None
 
     a, sa = array("kfan_lat"), array("kfan_stats")
-    if len(a) < 2 * LAT_BUCKETS:
+    if len(a) < SERIES_DEST0 * LAT_BUCKETS:
         sys.exit("kfan was built without LAT_HIST: set LAT_HIST=2 (kfan.env or environment) and restart it")
     time.sleep(secs)
     b, sb = array("kfan_lat"), array("kfan_stats")
@@ -101,7 +102,8 @@ def main():
     series = (len(b) // LAT_BUCKETS)
     hist = [[b.get(s * LAT_BUCKETS + i, 0) - a.get(s * LAT_BUCKETS + i, 0) for i in range(LAT_BUCKETS)]
             for s in range(series)]
-    first, last = summary(hist[0]), summary(hist[1])
+    first, last = summary(hist[SERIES_FIRST]), summary(hist[SERIES_LAST])
+    wait = summary(hist[SERIES_WAIT])
     d_first = sb.get(STAT_FIRST, 0) - sa.get(STAT_FIRST, 0)
     d_sent = sb.get(STAT_SENT, 0) - sa.get(STAT_SENT, 0)
     d_noxdp = sb.get(STAT_LAT_NOXDP, 0) - sa.get(STAT_LAT_NOXDP, 0)
@@ -113,14 +115,19 @@ def main():
           "(arrival at the NIC driver -> copy handed to the NIC; no capture)")
     print(line("completion (arrival -> last dest)", last))
     print(line("first dest (arrival -> first dest)", first))
+    if wait:
+        print("where the time goes")
+        print(line("waiting (arrival -> fan-out starts)", wait))
+        print(f"  waiting is {100 * wait['mean_us'] / last['mean_us']:.0f}% of the mean completion time; "
+              "the rest is the fan-out sending its copies")
     sent_per = d_sent / d_first if d_first else 0
     print(f"guardrails\n  copies per shred {sent_per:.2f} (table has {len(labels)} destinations), "
           f"{d_noxdp} shreds without a driver-level time (left out)")
     per_dest = {}
-    if series > 2:
+    if series > SERIES_DEST0:
         print("per destination (send order)")
-        for i, name in enumerate(labels[:series - 2]):
-            s = summary(hist[2 + i])
+        for i, name in enumerate(labels[:series - SERIES_DEST0]):
+            s = summary(hist[SERIES_DEST0 + i])
             if s:
                 per_dest[name] = s
                 print(line(name, s))
@@ -128,7 +135,8 @@ def main():
         row = {"label": label, "unix_time": int(time.time()), "source": "kfan-hist",
                "meta": {"source": "kfan-hist", "window_s": str(secs)}, "capture_seconds": secs,
                "eligible_shreds": last["count"], "copies_per_shred": round(sent_per, 3),
-               "no_xdp_time": d_noxdp, "completion": last, "first_dest": first, "per_dest": per_dest}
+               "no_xdp_time": d_noxdp, "completion": last, "first_dest": first, "wait": wait,
+               "per_dest": per_dest}
         with open(results, "a") as f:
             f.write(json.dumps(row) + "\n")
         print(f"appended to {results}")

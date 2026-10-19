@@ -70,9 +70,11 @@
  * Optional -DLAT_HIST=1|2: latency histograms in kfan_lat, measured from the
  * arrival time xdpstamp.bpf.c wrote at the NIC driver to the moment each copy
  * was handed to the outgoing device (bpf_clone_redirect returned). Series 0:
- * first copy of each shred, 1: last copy (fan-out completion); with 2, also
- * 2 + i: destination i of the table. Read by `kfan.sh latency`. Shreds without
- * a driver-level time are counted (STAT_LAT_NOXDP) and left out.
+ * first copy of each shred, 1: last copy (fan-out completion), 2: wait before
+ * this program started on the shred (driver -> packet buffer, bond, and any
+ * queueing behind earlier packets on the CPU); with 2, also 3 + i:
+ * destination i of the table. Read by `kfan.sh latency`. Shreds without a
+ * driver-level time are counted (STAT_LAT_NOXDP) and left out.
  */
 #ifndef LAT_HIST
 #define LAT_HIST 0
@@ -81,6 +83,8 @@
 #define LAT_BUCKETS (LAT_FINE + 16)    /* then 1 ms buckets up to ~17 ms */
 #define LAT_FIRST 0
 #define LAT_LAST 1
+#define LAT_WAIT 2
+#define LAT_DEST0 3
 
 #ifndef GROUPS
 #define GROUPS 1
@@ -160,8 +164,8 @@ static __always_inline void count(__u32 i)
 		(*v)++;
 }
 
-/* Series 0/1 always; one per destination of group 0 with LAT_HIST=2. */
-#define LAT_SERIES (LAT_HIST >= 2 ? 2 + MAX_PER_GROUP : 2)
+/* Series 0-2 always; one per destination of group 0 with LAT_HIST=2. */
+#define LAT_SERIES (LAT_HIST >= 2 ? LAT_DEST0 + MAX_PER_GROUP : LAT_DEST0)
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -252,7 +256,7 @@ static __always_inline void send_group(struct __sk_buff *skb, __u32 g, __u32 l4,
 			if (i == 0)
 				lat_add(LAT_FIRST, last);
 			if (LAT_HIST >= 2)
-				lat_add(2 + i, last);
+				lat_add(LAT_DEST0 + i, last);
 		}
 	}
 	if (LAT_HIST && lat_rx && last)
@@ -267,6 +271,7 @@ int kfan(struct __sk_buff *skb)
 	struct shred_key key;
 	struct dest *d;
 	__u64 rx_ns = 0, magic = STAMP_MAGIC;
+	__u64 start_ns = LAT_HIST ? bpf_ktime_get_ns() : 0; /* this program started on the packet */
 	__u8 first_byte;
 	__u32 ihl, l4, g = 0, zero = 0;
 	__be16 sport;
@@ -368,6 +373,8 @@ int kfan(struct __sk_buff *skb)
 
 	if (LAT_HIST && g == 0 && !lat_rx)
 		count(STAT_LAT_NOXDP);
+	if (LAT_HIST && lat_rx)
+		lat_add(LAT_WAIT, start_ns - lat_rx);
 	send_group(skb, g, l4, ip.saddr, ip.daddr, rx_ns, magic, lat_rx);
 	return TC_ACT_SHOT;
 }
