@@ -20,6 +20,7 @@ install -m 0755 "$SRC/scripts/kfan.sh" "$OPT/scripts/kfan.sh"
 install -m 0755 "$SRC/scripts/kfan_latency.py" "$OPT/scripts/kfan_latency.py"
 install -m 0644 "$SRC/ebpf/kfan.bpf.c" "$OPT/ebpf/kfan.bpf.c"
 install -m 0644 "$SRC/deploy/README.md" "$OPT/README.md"
+install -m 0755 "$SRC/deploy/preflight.sh" "$OPT/preflight.sh"
 if [ -e "$ETC/kfan.env" ]; then
     echo "kept existing $ETC/kfan.env"
 else

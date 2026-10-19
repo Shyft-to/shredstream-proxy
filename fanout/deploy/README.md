@@ -11,8 +11,40 @@ program is detached or passes everything on, and the proxies forward exactly
 as before, within milliseconds. Destinations deduplicate, so a short overlap
 during switch-over is harmless.
 
-Measured on a real receiver (2026-10-16, see `progress/chapter-03`):
-first arrival on the server → receiver p50 ~53 µs, p99 ~93 µs.
+Measured on the first server (2026-10-16/19, box probe, 15 destinations,
+see `progress/`): first arrival → last copy leaves p50 ~82 µs, p99 ~245 µs;
+delivery 100%, no duplicate sends, ~0.2 core. Before (3 proxies): p50
+321 µs, p99 5.4 ms, ~8 cores.
+
+## Version 1
+
+v1 is `shred-kfan.service` with DIRECT=1 and its own duplicate dropping.
+Not part of v1 (measurement / experiments; leave them off on new servers):
+`xdpstamp.sh`, `LAT_HIST`, `STAMP_PORT`, the AF_XDP forwarder (`fanout/xsk`),
+and any `gro_normal_batch` change.
+
+## Deploy to a new server
+
+1. **Prerequisites:** the proxies (one per source port) run and forward to
+   the destinations; `sudo apt install -y clang llvm libbpf-dev linux-tools-common linux-tools-$(uname -r)`
+   (for `bpftool`); a checkout of the `fanout-opt` branch.
+2. **Configure:**
+   `sudo mkdir -p /etc/shred-fanout && sudo cp fanout/deploy/kfan.env.example /etc/shred-fanout/kfan.env`,
+   then set `PORTS` (the source ports), `DESTS` (exactly the proxies'
+   `--dest-ip-ports`) and `DEV` (the bond or interface the shreds arrive on).
+3. **Check (read-only):** `sudo fanout/deploy/preflight.sh`. It compares the
+   destinations with the running proxies, resolves every next hop, and passes
+   the program through this kernel's verifier without attaching it. Do not
+   go on with any FAIL; read every WARN.
+4. **Install and start:** `sudo fanout/deploy/install.sh && sudo systemctl start shred-kfan`.
+5. **Verify within the first minutes:**
+   - journal (`sudo journalctl -u shred-kfan -f`): `loaded N destinations`;
+     after 60 s `sent` ≈ N × `first`, `refused` / `no_dests` / `error` +0;
+   - **every local destination (127.x) receives data, checked at the
+     consuming service itself** (a capture cannot show this);
+   - the proxies' CPU drops (they no longer receive the shreds).
+   - Problem → `sudo systemctl stop shred-kfan` (proxies forward again at once).
+6. **After an hour without problems:** `sudo systemctl enable shred-kfan`.
 
 ## Files
 

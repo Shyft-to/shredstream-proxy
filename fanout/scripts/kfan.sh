@@ -10,6 +10,9 @@
 #   kfan.sh cost [SECONDS]       measured kernel CPU time per packet (default 10 s)
 #   kfan.sh watch DESTS          keep the table current: reload when bond ports
 #                                go up/down, re-resolve MACs every REFRESH_S (60)
+#   kfan.sh build PORTS          compile only (OBJ=path to choose the output)
+#   kfan.sh resolve DESTS        dry run: how each destination would be sent; fails if
+#                                any cannot be resolved (nothing is loaded)
 #   kfan.sh run PORTS DESTS      for a service: (re)attach, then watch, logging the
 #                                counters every LOG_S (60); detaches on SIGTERM
 #   kfan.sh check-dests DESTS    compare DESTS with the running proxies'
@@ -36,7 +39,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$DIR/../ebpf/kfan.bpf.c"
-OBJ=/run/fanout-kfan.bpf.o
+OBJ=${OBJ:-/run/fanout-kfan.bpf.o}
 DEV=${DEV:-bond0}
 DROP_PORTS=${DROP_PORTS:-}
 DIRECT=${DIRECT:-0}
@@ -394,6 +397,18 @@ if not found:
 EOF
 }
 
+# Dry run of load_dests: prints how each destination would be sent.
+resolve_all() {
+    local d j=0 bad=0
+    IFS=, read -ra all <<<"$1"
+    for d in "${all[@]}"; do
+        resolve "$d" "$j" >/dev/null || bad=$((bad + 1))
+        j=$((j + 1))
+    done
+    [ "$bad" -eq 0 ] || { echo "$bad of ${#all[@]} destinations could not be resolved" >&2; return 1; }
+    echo "all ${#all[@]} destinations resolve"
+}
+
 latency() {
     ours || { echo "kfan is not attached" >&2; exit 1; }
     python3 "$DIR/kfan_latency.py" "$@"
@@ -481,7 +496,9 @@ case "${1:-}" in
     cost) shift; cost "$@" ;;
     watch) shift; watch_ports "$@" ;;
     run) shift; run "$@" ;;
+    build) shift; [ $# -eq 1 ] || { echo "usage: kfan.sh build PORTS" >&2; exit 1; }; build "$1"; echo "built $OBJ" ;;
+    resolve) shift; [ $# -eq 1 ] || { echo "usage: kfan.sh resolve DESTS" >&2; exit 1; }; resolve_all "$1" ;;
     check-dests) shift; check_dests "$@" ;;
     latency) shift; latency "$@" ;;
-    *) sed -n '2,29p' "$0"; exit 1 ;;
+    *) sed -n '2,37p' "$0"; exit 1 ;;
 esac

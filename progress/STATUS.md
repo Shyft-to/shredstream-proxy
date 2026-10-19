@@ -38,6 +38,16 @@ are per forwarder and not directly comparable. The production row rests on
 3.5 ms. The lab is ~5× slower than production (likely too few cores), so
 candidates are now tested on production traffic with alternating A/B runs.
 
+## Version 1 (for all regions)
+
+`shred-kfan.service` (fanout/deploy/): kernel fan-out on tc ingress, DIRECT
+to the NIC ports, its own duplicate dropping, local-destination fix. Box
+probe on the first server: **p50 ~82 µs, p99 ~245 µs, delivery 100%,
+~0.2 core** (start: 321 µs / 5.4 ms / ~8 cores). New servers: run
+`fanout/deploy/preflight.sh` first (README there). Remaining tail = one CPU
+saturating in bursts (true p99 between ~250 µs and >1 ms); next lever:
+spread bursts over CPUs.
+
 ## Key findings
 
 1. **Kernel fan-out cuts the tail 7.5×.** One eBPF program on `bond0`
