@@ -53,7 +53,7 @@ spread bursts over CPUs.
 | Region | Status | Baseline (box probe) | With v1 (box probe) |
 |---|---|---|---|
 | Ams (first server) | v1 live since 2026-10-16 | p50 321 µs, p99 5.4 ms, ~8 cores | p50 ~82 µs, p99 ~245 µs, ~0.2 core |
-| Fra | 2026-11-02: survey + baseline pending | — | — |
+| Fra | 2026-11-02: surveyed; v1 needs >16 destinations and per-source lists | pending | — |
 
 ## Key findings
 

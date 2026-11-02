@@ -5,7 +5,10 @@
 # Usage:
 #   probe.sh measure PORT [SECONDS] [LABEL]   north star for the live instance listening on PORT
 #   probe.sh box PORTS [SECONDS] [LABEL]      box-level north star across the forwarders on PORTS
-#                                             (comma separated); results in box-results.jsonl
+#                                             (comma separated); results in box-results.jsonl.
+#                                             DESTS=ip:port,... judges against that list instead
+#                                             of the proxies' (e.g. without dead destinations,
+#                                             whose copies never leave the box)
 #   probe.sh corpus PORT [SECONDS] [FILE]     record full ingress packets to replay in the test bed
 #   probe.sh latency [SECONDS] [LABEL]        box-level latency of the kernel fan-out without any
 #                                             capture: arrival at the NIC driver -> each copy handed
@@ -162,6 +165,10 @@ box() {
     # The kernel fan-out (kfan) sends its copies from the listen ports themselves.
     src_ports=$(tr ',' '\n' <<<"${src_ports#,},$ports" | grep -v '^$' | sort -un | paste -sd,)
     all_dests=$(tr ',' '\n' <<<"${all_dests#,}" | grep -v '^$' | sort -u | paste -sd,)
+    if [ -n "${DESTS:-}" ]; then
+        all_dests=$(tr ',' '\n' <<<"$DESTS" | grep -v '^$' | sort -u | paste -sd,)
+        echo "destinations from DESTS, not from the proxies"
+    fi
 
     local filter="udp and (" sep=""
     for p in ${ports//,/ }; do filter+="${sep}dst port $p"; sep=" or "; done

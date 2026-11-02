@@ -21,7 +21,7 @@ indent() { sed 's/^/        /'; }
 [ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 2; }
 
 echo "== host"
-info "$(hostname), kernel $(uname -r), $(nproc) CPUs, up $(uptime -p 2>/dev/null || uptime)"
+info "$(hostname), kernel $(uname -r), $(nproc) CPUs, $(uptime -p 2>/dev/null || uptime)"
 info "git $(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 echo "== tools"
@@ -88,6 +88,8 @@ while IFS='|' read -r pid name unit port dests disc pct; do
     n=$(tr ',' '\n' <<<"$dests" | grep -c .)
     if ss -ulnH "sport = :$port" | grep -q .; then lst="listening"; else lst="NOT listening"; fi
     info "pid $pid $name ($unit): port $port $lst, $n destinations, CPU ${pct}% of a core"
+    dups=$(tr ',' '\n' <<<"$dests" | grep . | sort | uniq -d | paste -sd' ')
+    [ -z "$dups" ] || warn "pid $pid lists these destinations more than once (each copy is sent again): $dups"
     [ -z "$disc" ] || warn "pid $pid also discovers destinations from $disc; kfan only follows the static list"
     ports+=",$port"
     sorted=$(tr ',' '\n' <<<"$dests" | grep . | sort -u | paste -sd,)
@@ -138,7 +140,7 @@ echo "== where the shreds arrive (3 s capture per port)"
 arrive=""
 for p in ${ports//,/ }; do
     ifs=$(timeout 3 tcpdump -i any -nn -c 200 "udp and dst port $p" 2>/dev/null |
-        awk '{ print $2 }' | sort | uniq -c | sort -rn | awk '{ printf "%s(%s) ", $2, $1 }')
+        awk 'NF > 2 { print $2 }' | sort | uniq -c | sort -rn | awk '{ printf "%s(%s) ", $2, $1 }')
     info "port $p: ${ifs:-no packets in 3 s}"
     arrive+=" $ifs"
 done
