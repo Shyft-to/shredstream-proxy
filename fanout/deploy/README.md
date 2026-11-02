@@ -28,10 +28,15 @@ and any `gro_normal_batch` change.
 1. **Prerequisites:** the proxies (one per source port) run and forward to
    the destinations; `sudo apt install -y clang llvm libbpf-dev linux-tools-common linux-tools-$(uname -r)`
    (for `bpftool`); a checkout of the `fanout-opt` branch.
+   Survey (read-only): `sudo fanout/deploy/survey.sh`. It finds the proxies,
+   their ports and destinations, dead destinations, the arrival device and
+   anything already attached, and prints a draft `kfan.env`.
+   Baseline: see "Benchmark before and after" below, before any change.
 2. **Configure:**
    `sudo mkdir -p /etc/shred-fanout && sudo cp fanout/deploy/kfan.env.example /etc/shred-fanout/kfan.env`,
    then set `PORTS` (the source ports), `DESTS` (exactly the proxies'
-   `--dest-ip-ports`) and `DEV` (the bond or interface the shreds arrive on).
+   `--dest-ip-ports`) and `DEV` (the bond or interface the shreds arrive on)
+   from the survey's draft. The example's `DESTS` are the first server's.
 3. **Check (read-only):** `sudo fanout/deploy/preflight.sh`. It compares the
    destinations with the running proxies, resolves every next hop, and passes
    the program through this kernel's verifier without attaching it. Do not
@@ -45,6 +50,34 @@ and any `gro_normal_batch` change.
    - the proxies' CPU drops (they no longer receive the shreds).
    - Problem → `sudo systemctl stop shred-kfan` (proxies forward again at once).
 6. **After an hour without problems:** `sudo systemctl enable shred-kfan`.
+
+## Benchmark before and after
+
+Same method as the first server's numbers above (box probe: first arrival on
+any port → each destination's copy leaving the box, from captures). Needs
+`tcpdump` and the probe built once:
+`cargo build --release -p fanout-bench && chmod +x fanout-bench/scripts/*.sh`.
+
+```bash
+# PORTS from the survey; 6 runs of 60 s, 10 min apart (about an hour). Use tmux.
+for i in 1 2 3 4 5 6; do
+  sudo OUT=/root/bench-results fanout-bench/scripts/probe.sh box "$PORTS" 60 baseline
+  [ $i = 6 ] || sleep 540
+done
+```
+
+After the switch, the same loop with label `kfan`, plus the program's own
+CPU (`sudo /opt/shred-fanout/scripts/kfan.sh cost 20`; the probe only counts
+the proxies' CPU). Then:
+
+```bash
+target/release/fanout-measure compare --results /root/bench-results/box-results.jsonl \
+  --baseline baseline --candidate kfan
+```
+
+Runs before and after are not interleaved, so compare the number of shreds
+in each report (same 60 s window): a much quieter or busier hour skews the
+result.
 
 ## Files
 
