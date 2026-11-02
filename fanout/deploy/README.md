@@ -45,8 +45,10 @@ and any `gro_normal_batch` change.
 5. **Verify within the first minutes:**
    - journal (`sudo journalctl -u shred-kfan -f`): `loaded N destinations`;
      after 60 s `sent` ≈ N × `first`, `refused` / `no_dests` / `error` +0;
-   - **every local destination (127.x) receives data, checked at the
-     consuming service itself** (a capture cannot show this);
+   - **every local destination (127.x) receives data**, checked at the
+     receiving socket, not by capture:
+     `sudo /opt/shred-fanout/scripts/local-check.sh 30` must PASS (datagrams
+     queued on each local port vs shreds fanned out; needs `bpftrace`);
    - the proxies' CPU drops (they no longer receive the shreds).
    - Problem → `sudo systemctl stop shred-kfan` (proxies forward again at once).
 6. **After an hour without problems:** `sudo systemctl enable shred-kfan`.
