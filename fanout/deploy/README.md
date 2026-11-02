@@ -61,7 +61,7 @@ any port → each destination's copy leaving the box, from captures). Needs
 `cargo build --release -p fanout-bench && chmod +x fanout-bench/scripts/*.sh`.
 
 ```bash
-# PORTS from the survey; 6 runs of 60 s, 10 min apart (about an hour). Use tmux.
+# PORTS from the survey; 6 runs of 60 s, 10 min apart (about an hour).
 for i in 1 2 3 4 5 6; do
   sudo OUT=/root/bench-results fanout-bench/scripts/probe.sh box "$PORTS" 60 baseline
   [ $i = 6 ] || sleep 540
