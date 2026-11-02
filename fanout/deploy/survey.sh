@@ -107,7 +107,7 @@ all_dests=${all_dests#,}
 np=$(tr ',' '\n' <<<"$ports" | grep -c .)
 nd=$(tr ',' '\n' <<<"$all_dests" | grep -c .)
 if [ "$np" -le 4 ]; then pass "$np source ports: $ports"; else fail "$np source ports; kfan handles at most 4"; fi
-if [ "$nd" -le 16 ]; then pass "$nd destinations in total"; else fail "$nd destinations; kfan handles at most 16"; fi
+if [ "$nd" -le 32 ]; then pass "$nd destinations in total"; else fail "$nd destinations; kfan handles at most 32 on one CPU"; fi
 
 echo "== destinations (neighbour state as cached; nothing is probed)"
 for d in ${all_dests//,/ }; do

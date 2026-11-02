@@ -44,7 +44,10 @@ if [ -n "${PORTS:-}" ] && [ "$n" -gt 0 ]; then
 else
     fail "config: PORTS and DESTS must be set in $ENV_FILE"
 fi
-[ "$n" -le 16 ] || fail "config: $n destinations, at most 16 per group"
+per=$(((n + ${KFAN_GROUPS:-1} - 1) / ${KFAN_GROUPS:-1}))
+if [ "$per" -le 16 ]; then KFAN_PER_GROUP=16; elif [ "$per" -le 32 ]; then KFAN_PER_GROUP=32
+else fail "config: $n destinations, at most 32 per group"; KFAN_PER_GROUP=32; fi
+export KFAN_PER_GROUP
 if [ -n "${STAMP_PORT:-}${LAT_HIST:-}${SHADOW:-}" ]; then
     warn "config: measurement options set (STAMP_PORT/LAT_HIST); not part of v1"
 fi

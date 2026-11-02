@@ -103,13 +103,15 @@
 #define GROUPS 1
 #endif
 #define MAX_GROUPS 4
-#define MAX_PER_GROUP 16
+#ifndef MAX_PER_GROUP
+#define MAX_PER_GROUP 16 /* kfan.sh builds with 32 when a group needs more */
+#endif
 #define CARRIER_MARK 0x6b660000 /* "kf" << 16 | group */
 #define CARRIER_MASK 0xffff0000
 
 #define KEY_BYTES 88
 #define SEEN_ENTRIES 1048576
-#define MAX_DESTS (MAX_GROUPS * MAX_PER_GROUP) /* group g: entries g*16 .. g*16+15 */
+#define MAX_DESTS (MAX_GROUPS * MAX_PER_GROUP) /* group g: entries g*MAX_PER_GROUP .. */
 #define EEXIST 17
 
 #define IP_CSUM_OFF (ETH_HLEN + offsetof(struct iphdr, check))

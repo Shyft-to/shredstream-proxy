@@ -56,7 +56,7 @@ def dest_labels():
     """Destination index -> ip:port, from the table kfan sends with."""
     entries = {num(r["key"]): raw(r["value"]) for r in dump("kfan_dests")}
     labels = []
-    for k in range(16):  # group 0; the list ends at the first empty entry
+    for k in range(len(entries) // 4):  # group 0 (4 groups); ends at the first empty entry
         b = entries.get(k, b"")
         if len(b) < 28 or int.from_bytes(b[0:4], "little") == 0:
             break

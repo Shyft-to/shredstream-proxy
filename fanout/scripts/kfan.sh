@@ -26,6 +26,7 @@
 #   UDP to these ports is dropped, e.g. to switch a source off), DIRECT=1
 #   (send straight to the physical NIC ports: skips the VLAN and bond layers;
 #   the NIC adds the VLAN tag; destinations are spread over the bond's ports),
+#   Up to 32 destinations per group (16 slots per group unless more are needed).
 #   KFAN_GROUPS=n (1..4, default 1) with KFAN_CPUS=c1,c2,.. (n-1 CPUs): multi-CPU
 #   fan-out. Destinations are split into n groups; group 0 is sent on the
 #   receiving CPU, group i on CPU ci (receive packet steering on DEV rx-0).
@@ -48,9 +49,29 @@ LAT_HIST=${LAT_HIST:-}
 KFAN_GROUPS=${KFAN_GROUPS:-1}
 KFAN_CPUS=${KFAN_CPUS:-}
 PREF=7700
-PER_GROUP=16
+PER_GROUP=${KFAN_PER_GROUP:-16}
 STATE=/run/fanout-kfan.state
 LO_STATE=/run/fanout-kfan.lo-sysctl
+
+# Slots per group for DESTS: 16, or 32 when a group needs more.
+size_groups() {
+    local n per
+    n=$(tr ',' '\n' <<<"$1" | grep -c .)
+    per=$(((n + KFAN_GROUPS - 1) / KFAN_GROUPS))
+    if [ "$per" -le 16 ]; then PER_GROUP=16
+    elif [ "$per" -le 32 ]; then PER_GROUP=32
+    else echo "$n destinations in $KFAN_GROUPS group(s): at most 32 per group" >&2; return 1
+    fi
+}
+
+# Slots per group of the attached program (its table holds 4 groups).
+map_per_group() {
+    bpftool -j map show name kfan_dests | python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+m = m[0] if isinstance(m, list) else m
+print(m["max_entries"] // 4)'
+}
 
 attached() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -q "pref $PREF "; }
 ours() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -A1 "pref $PREF " | grep -q kfan; }
@@ -70,7 +91,7 @@ build() {
         defs+=("-DDROP_${names[$i]}=$p")
         i=$((i + 1))
     done
-    defs+=("-DGROUPS=$KFAN_GROUPS")
+    defs+=("-DGROUPS=$KFAN_GROUPS" "-DMAX_PER_GROUP=$PER_GROUP")
     if [ -n "$STAMP_PORT" ]; then
         [[ "$STAMP_PORT" =~ ^[0-9]+$ ]] || { echo "bad STAMP_PORT: $STAMP_PORT" >&2; exit 1; }
         defs+=("-DSTAMP_PORT=$STAMP_PORT")
@@ -184,6 +205,7 @@ load_dests() {
     local dests=() groups=() entries=() d j=0 g i n line first=""
     IFS=, read -ra dests <<<"$1"
     [ ${#dests[@]} -ge 1 ] || { echo "no destinations" >&2; return 1; }
+    PER_GROUP=$(map_per_group) || { echo "cannot read the kfan_dests table" >&2; return 1; }
     # Before any local copy is sent (see lo_local_on).
     if [[ ",$1" == *,127.* ]]; then
         lo_local_on
@@ -199,7 +221,7 @@ load_dests() {
     for ((g = KFAN_GROUPS - 1; g >= 0; g--)); do
         mapfile -t entries < <(printf '%s' "${groups[$g]}" | sort -s -n -k1,1 | cut -d' ' -f2-)
         n=${#entries[@]}
-        [ "$n" -le $PER_GROUP ] || { echo "group $g has $n destinations, max $PER_GROUP" >&2; return 1; }
+        [ "$n" -le $PER_GROUP ] || { echo "group $g has $n destinations, max $PER_GROUP (restart to rebuild for more)" >&2; return 1; }
         for ((i = (g == 0 ? 1 : 0); i < n; i++)); do
             bpftool map update name kfan_dests key hex $(hex_le32 $((g * PER_GROUP + i))) value hex ${entries[$i]}
         done
@@ -323,6 +345,7 @@ attach() {
         echo "KFAN_CPUS must list exactly $((KFAN_GROUPS - 1)) CPUs for KFAN_GROUPS=$KFAN_GROUPS" >&2
         exit 1
     fi
+    size_groups "$2" || exit 1
     build "$1"
     tc qdisc show dev "$DEV" | grep -q clsact || tc qdisc add dev "$DEV" clsact
     tc filter add dev "$DEV" ingress pref "$PREF" handle 1 bpf direct-action obj "$OBJ" sec tc
