@@ -1,6 +1,6 @@
 # Fan-out latency — status
 
-_Updated 2026-10-19_
+_Updated 2026-11-02_
 
 ## Goal
 
@@ -47,6 +47,13 @@ probe on the first server: **p50 ~82 µs, p99 ~245 µs, delivery 100%,
 `fanout/deploy/preflight.sh` first (README there). Remaining tail = one CPU
 saturating in bursts (true p99 between ~250 µs and >1 ms); next lever:
 spread bursts over CPUs.
+
+## Rollout
+
+| Region | Status | Baseline (box probe) | With v1 (box probe) |
+|---|---|---|---|
+| Ams (first server) | v1 live since 2026-10-16 | p50 321 µs, p99 5.4 ms, ~8 cores | p50 ~82 µs, p99 ~245 µs, ~0.2 core |
+| Fra | 2026-11-02: survey + baseline pending | — | — |
 
 ## Key findings
 
@@ -145,3 +152,4 @@ spread bursts over CPUs.
 | [2](chapter-02-2026-10-15.md) | 2026-10-15 | Candidate testing moved to live production traffic (A/B); `shred-fanout` v1 limited by send capacity; sources overlap 98.8%; kernel dedup proven (p99 −55%); userspace fan-out variants; kernel fan-out: p99 −87% vs dedup + proxies |
 | [3](chapter-03-2026-10-16.md) | 2026-10-16 | Real-receiver measurement: kernel fan-out p50 ~53 / p99 ~93 µs end to end; AF_XDP fast to its send ring but slow to the wire (p99 ~1.1 ms) |
 | [4](chapter-04-2026-10-19.md) | 2026-10-19 | Local-delivery fix tested end to end; capture-free exact box latency (`probe.sh latency`: NIC-driver stamp → in-kernel histograms) |
+| [5](chapter-05-2026-11-02.md) | 2026-11-02 | Fra rollout started: plan, read-only survey script, before/after benchmark procedure |
