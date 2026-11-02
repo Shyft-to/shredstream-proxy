@@ -38,6 +38,7 @@ for r in json.load(sys.stdin):
 }
 udp_in() { nstat -az UdpInDatagrams | awk '/UdpInDatagrams/ { print $2 }'; }
 
+echo "starting bpftrace (can take ~20 s)..."
 cond=$(for p in $ports; do printf '$p == %s || ' "$p"; done)
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
@@ -48,10 +49,11 @@ kprobe:__udp_enqueue_schedule_skb
     if (${cond% || }) { @queued[\$p] = count(); }
 }" >"$out" 2>&1 &
 bt=$!
-for _ in $(seq 100); do grep -q Attaching "$out" && break; kill -0 $bt 2>/dev/null || break; sleep 0.2; done
+for _ in $(seq 300); do grep -q Attaching "$out" && break; kill -0 $bt 2>/dev/null || break; sleep 0.2; done
 grep -q Attaching "$out" || { cat "$out" >&2; echo "bpftrace did not start" >&2; exit 1; }
 
 f0=$(kfan_first) u0=$(udp_in)
+echo "counting for ${SECS}s..."
 sleep "$SECS"
 f1=$(kfan_first) u1=$(udp_in)
 kill -INT $bt
