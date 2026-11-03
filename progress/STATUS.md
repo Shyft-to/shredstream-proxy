@@ -53,7 +53,7 @@ spread bursts over CPUs.
 | Region | Status | Baseline (box probe) | With v1 (box probe) |
 |---|---|---|---|
 | Ams (first server) | v1 live since 2026-10-16 | p50 321 µs, p99 5.4 ms, ~8 cores | p50 ~82 µs, p99 ~245 µs, ~0.2 core |
-| Fra | kfan live since 2026-11-02 12:59 UTC (23 destinations, not yet enabled at boot) | p50 179 µs, p99 2.56 ms, ~2.9 cores | p50 176 µs, **p99 373 µs** (low end: misses NIC ring wait), ~0.13 core, delivery 100% |
+| Fra | **rolled back 2026-11-03** (proxies forward); kfan adds ~1 ms to geyserbench p50 (under investigation) | p50 179 µs, p99 2.56 ms, ~2.9 cores | p50 176 µs, **p99 373 µs** (low end: misses NIC ring wait), ~0.13 core, delivery 100% |
 
 ## Key findings
 
@@ -153,3 +153,4 @@ spread bursts over CPUs.
 | [3](chapter-03-2026-10-16.md) | 2026-10-16 | Real-receiver measurement: kernel fan-out p50 ~53 / p99 ~93 µs end to end; AF_XDP fast to its send ring but slow to the wire (p99 ~1.1 ms) |
 | [4](chapter-04-2026-10-19.md) | 2026-10-19 | Local-delivery fix tested end to end; capture-free exact box latency (`probe.sh latency`: NIC-driver stamp → in-kernel histograms) |
 | [5](chapter-05-2026-11-02.md) | 2026-11-02 | Fra rollout: survey (31 destinations, 6 dead), baseline p99 2.56 ms, kfan live (up to 32 destinations): p99 373 µs (low end) |
+| [6](chapter-06-2026-11-03.md) | 2026-11-03 | Fra rolled back to proxies: geyserbench p50 +1 ms with kfan; per-shred north star misses burst (FEC set) completion |
