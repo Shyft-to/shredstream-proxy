@@ -8,11 +8,14 @@ only when the busy CPU picks it up, and misses the wait in the NIC ring).
 
 It then replays every arriving packet through a model of kfan: a CPU handles
 its packets in arrival order; a duplicate costs DUP_US; a first copy costs
-BASE_US + COPY_US per destination, the copies leaving in table order. Two
-placements of the work:
+BASE_US + COPY_US per destination, the copies leaving in table order. Placements of the work:
   one CPU    every packet on one CPU (what the measured kfan did for everstake)
   per flow   each incoming flow (NIC port, source, port) on its own CPU, one
              shared duplicate table: whoever starts on a shred first sends it
+  spread N   (--spread) the receiving CPU only drops duplicates and hands each
+             new shred, HANDOFF_US later, to the least busy of N sending CPUs
+plus a reference with no forwarding delay at all (copies leave on arrival):
+the part of a FEC set's time that is just its shreds arriving spread out.
 And it reports, for the proxies (measured) and both models:
   - per shred: true first arrival -> first / last copy leaving
   - for one destination (--focus): per shred, and per FEC set: first shred of
@@ -126,6 +129,8 @@ def main():
     ap.add_argument("--copy-us", type=float, default=1.3, help="kfan CPU time per copy (Fra, no capture: ~1.3)")
     ap.add_argument("--dup-us", type=float, default=0.6, help="kfan CPU time per dropped duplicate")
     ap.add_argument("--base-us", type=float, default=1.0, help="kfan CPU time per first copy before sending")
+    ap.add_argument("--spread", default="2,3,4,6", help="sending CPUs to model for 'spread N' (comma separated)")
+    ap.add_argument("--handoff-us", type=float, default=20, help="spread N: delay from hand-off to the sending CPU starting")
     ap.add_argument("--edge-ms", type=float, default=500, help="ignore shreds this close to the capture's ends")
     a = ap.parse_args()
 
@@ -208,8 +213,9 @@ def main():
 
     C, D, B = a.copy_us * 1000, a.dup_us * 1000, a.base_us * 1000
 
-    def model(per_flow):
-        """Start time of each shred's fan-out, and the busiest CPU's share."""
+    def model(per_flow, workers=0, handoff=0.0):
+        """Start time of each shred's fan-out, and the busiest CPU's share.
+        workers > 0: receiving CPUs (one per flow) only dedup and hand off."""
         start = [None] * n
         queues = {}
         for ts, fid, sid in events:
@@ -219,10 +225,18 @@ def main():
         busy = {c: 0.0 for c in queues}
         heap = [(q[0][0], c) for c, q in queues.items()]
         heapq.heapify(heap)
+        wfree = [(0.0, w) for w in range(workers)]
+        wbusy = [0.0] * workers
         while heap:
             st, c = heapq.heappop(heap)
             ts, sid = queues[c][idx[c]]
-            if start[sid] is None:
+            if start[sid] is None and workers:
+                f, w = heapq.heappop(wfree)
+                start[sid] = max(st + D + handoff, f)
+                wbusy[w] += B + nd * C
+                heapq.heappush(wfree, (start[sid] + B + nd * C, w))
+                cost = D
+            elif start[sid] is None:
                 start[sid] = st
                 cost = B + nd * C
             else:
@@ -232,7 +246,7 @@ def main():
             idx[c] += 1
             if idx[c] < len(queues[c]):
                 heapq.heappush(heap, (max(queues[c][idx[c]][0], free[c]), c))
-        return start, max(busy.values()) / (t1 - t0)
+        return start, max(list(busy.values()) + wbusy) / (t1 - t0)
 
     def report(name, at):
         """at(sid, d) -> time the copy for destination d left (None if never)."""
@@ -269,11 +283,14 @@ def main():
         row = eg[s]
         return row[d] if row is not None and row[d] >= 0 else None
 
+    report("no forwarding delay (reference: copies leave on arrival)", lambda s, d: first_ns[s])
     report("proxies, measured", measured)
-    for per_flow in (False, True):
-        start, util = model(per_flow)
-        name = ("kfan model, one CPU per incoming flow" if per_flow else "kfan model, one CPU") + \
-            f" (busiest CPU {100 * util:.0f}%; copy {a.copy_us} us, dup {a.dup_us} us)"
+    designs = [(f"kfan model, one CPU", (False,)), ("kfan model, one CPU per incoming flow", (True,))]
+    designs += [(f"kfan model, spread over {w} sending CPUs (hand-off {a.handoff_us:g} us)", (True, w, a.handoff_us * 1000))
+                for w in (int(x) for x in a.spread.split(",") if x)]
+    for name, args in designs:
+        start, util = model(*args)
+        name += f" (busiest CPU {100 * util:.0f}%; copy {a.copy_us} us, dup {a.dup_us} us)"
         report(name, lambda s, d, start=start: None if start[s] is None else start[s] + B + (pos[d] + 1) * C)
 
 
