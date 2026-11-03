@@ -144,6 +144,32 @@ struct CommonArgs {
     /// Number of threads to use. Defaults to use up to 4.
     #[arg(long, env)]
     num_threads: Option<usize>,
+
+    /// Forward with this many sender threads, each owning a share of the
+    /// destinations (one `sendmmsg` per destination per batch), instead of one
+    /// thread per destination. 0 = one thread per destination.
+    #[arg(long, env, default_value_t = 0)]
+    send_shards: usize,
+
+    /// CPUs to pin the sender threads to, one per shard, comma separated.
+    /// A pinned sender busy-polls its queue (one full core each).
+    #[arg(long, env, value_delimiter = ',')]
+    send_cores: Vec<usize>,
+
+    /// CPU to pin the listen and dispatch threads to.
+    #[arg(long, env)]
+    recv_core: Option<usize>,
+
+    /// Socket busy polling on the listen sockets, in microseconds
+    /// (`SO_BUSY_POLL`). 0 = off.
+    #[arg(long, env, default_value_t = 0)]
+    recv_busy_poll_us: u32,
+
+    /// With `--send-shards`: bond device whose layer3+4 hash should spread the
+    /// destinations evenly over its ports; each destination's source port is
+    /// chosen accordingly. Eg. `bond0`.
+    #[arg(long, env)]
+    balance_bond: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -238,6 +264,12 @@ fn main() -> Result<(), ShredstreamProxyError> {
     {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
     }
+    if !args.send_cores.is_empty() && args.send_cores.len() != args.send_shards {
+        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--send-cores must list exactly one CPU per --send-shards.")));
+    }
+    if args.balance_bond.is_some() && args.send_shards == 0 {
+        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--balance-bond requires --send-shards.")));
+    }
 
     let exit = Arc::new(AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) =
@@ -311,6 +343,13 @@ fn main() -> Result<(), ShredstreamProxyError> {
         metrics.clone(),
         shutdown_receiver.clone(),
         exit.clone(),
+        forwarder::SendConfig {
+            shards: args.send_shards,
+            shard_cores: args.send_cores.clone(),
+            recv_core: args.recv_core,
+            recv_busy_poll_us: args.recv_busy_poll_us,
+            balance_bond: args.balance_bond.clone(),
+        },
     );
     thread_handles.extend(forwarder_hdls);
 

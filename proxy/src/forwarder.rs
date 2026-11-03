@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
@@ -10,7 +10,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, RecvError, TrySendError};
+use crossbeam_channel::{Receiver, RecvError, TryRecvError, TrySendError};
 use dashmap::DashMap;
 use itertools::Itertools;
 use jito_protos::shredstream::{Entry as PbEntry, TraceShred};
@@ -91,6 +91,29 @@ pub type WorkerMsg = (Arc<PacketBatch>, Option<Arc<BatchTrace>>);
 /// of this map and dispatch a `WorkerMsg` to each sender.
 pub type DestSenderMap = HashMap<SocketAddr, crossbeam_channel::Sender<WorkerMsg>>;
 
+/// Opt-in sender layout. The default (all off) is one worker thread per
+/// destination.
+#[derive(Clone, Debug, Default)]
+pub struct SendConfig {
+    /// Sender threads, each owning a share of the destinations (one
+    /// `sendmmsg` per destination per batch); 0 = one worker per destination.
+    pub shards: usize,
+    /// CPU per shard, in shard order. A pinned shard busy-polls its queue
+    /// instead of sleeping (one full core each).
+    pub shard_cores: Vec<usize>,
+    /// CPU for the listen and dispatch threads.
+    pub recv_core: Option<usize>,
+    /// `SO_BUSY_POLL` (µs) on the listen sockets; 0 = off.
+    pub recv_busy_poll_us: u32,
+    /// Bond (layer3+4 hash) whose ports the destinations should be spread
+    /// over evenly, by choosing each destination's source port.
+    pub balance_bond: Option<String>,
+}
+
+/// Source ports tried for `SendConfig::balance_bond` (the kernel's default
+/// ephemeral range, so service ports below it are never taken).
+const BALANCE_PORTS: std::ops::Range<u16> = 33_000..60_000;
+
 /// Bind to ports and start forwarding shreds
 #[allow(clippy::too_many_arguments)]
 pub fn start_forwarder_threads(
@@ -108,6 +131,7 @@ pub fn start_forwarder_threads(
     metrics: Arc<ShredMetrics>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
+    send_config: SendConfig,
 ) -> Vec<JoinHandle<()>> {
     let num_threads = num_threads
         .unwrap_or_else(|| usize::from(std::thread::available_parallelism().unwrap()).min(4));
@@ -124,6 +148,12 @@ pub fn start_forwarder_threads(
     .unwrap_or_else(|_| {
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
+    if send_config.recv_busy_poll_us > 0 {
+        sockets
+            .iter()
+            .for_each(|s| set_busy_poll(s, send_config.recv_busy_poll_us));
+    }
+    let recv_core = send_config.recv_core;
 
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
@@ -185,15 +215,27 @@ pub fn start_forwarder_threads(
     let dest_senders: Arc<ArcSwap<DestSenderMap>> =
         Arc::new(ArcSwap::from_pointee(DestSenderMap::default()));
 
-    // Spawn the dest manager. It reconciles `dest_senders` against
-    // `unioned_dest_sockets` and owns the worker join handles.
-    let dest_mgr_hdl = start_dest_manager_thread(
-        unioned_dest_sockets.clone(),
-        dest_senders.clone(),
-        metrics.clone(),
-        shutdown_receiver.clone(),
-        exit.clone(),
-    );
+    // Spawn the dest manager (or, with send shards, the shard manager). It
+    // reconciles `dest_senders` against `unioned_dest_sockets` and owns the
+    // sender join handles.
+    let dest_mgr_hdl = if send_config.shards > 0 {
+        start_shard_manager_thread(
+            unioned_dest_sockets.clone(),
+            dest_senders.clone(),
+            send_config.clone(),
+            metrics.clone(),
+            shutdown_receiver.clone(),
+            exit.clone(),
+        )
+    } else {
+        start_dest_manager_thread(
+            unioned_dest_sockets.clone(),
+            dest_senders.clone(),
+            metrics.clone(),
+            shutdown_receiver.clone(),
+            exit.clone(),
+        )
+    };
     thread_hdls.push(dest_mgr_hdl);
 
     sockets
@@ -214,6 +256,9 @@ pub fn start_forwarder_threads(
                 None,
                 false,
             );
+            if let Some(core) = recv_core {
+                pin_thread(&listen_thread, core);
+            }
 
             let deduper = deduper.clone();
             let metrics = metrics.clone();
@@ -225,6 +270,9 @@ pub fn start_forwarder_threads(
             let send_thread = Builder::new()
                 .name(format!("ssPxyTx_{thread_id}"))
                 .spawn(move || {
+                    if let Some(core) = recv_core {
+                        pin_current_thread(core);
+                    }
                     while !exit.load(Ordering::Relaxed) {
                         crossbeam_channel::select! {
                             // forward packets
@@ -521,6 +569,376 @@ fn update_max_atomic(cell: &AtomicU64, val: u64) {
             Err(observed) => prev = observed,
         }
     }
+}
+
+/// A destination owned by a send shard. Each has its own socket, so its
+/// source port can be chosen (see `SendConfig::balance_bond`).
+struct ShardDest {
+    addr: SocketAddr,
+    socket: UdpSocket,
+}
+
+/// A shard's current destinations, replaced by the shard manager on change.
+type ShardDests = Arc<ArcSwap<Vec<Arc<ShardDest>>>>;
+
+/// Key of shard `i` in `DestSenderMap`; coordinators only use the values.
+fn shard_key(i: usize) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), i as u16)
+}
+
+/// Spawns `config.shards` send shards once, then keeps their destinations in
+/// sync with `unioned_dest_sockets` (and with the bond's ports going up or
+/// down when balancing). Publishes one sender per shard to the coordinators.
+fn start_shard_manager_thread(
+    unioned_dest_sockets: Arc<ArcSwap<Vec<SocketAddr>>>,
+    dest_senders: Arc<ArcSwap<DestSenderMap>>,
+    config: SendConfig,
+    metrics: Arc<ShredMetrics>,
+    shutdown_receiver: Receiver<()>,
+    exit: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    Builder::new()
+        .name("ssPxyShardMgr".to_string())
+        .spawn(move || {
+            let mut owned = DestSenderMap::default();
+            let mut handles = Vec::with_capacity(config.shards);
+            let mut shard_dests: Vec<ShardDests> = Vec::with_capacity(config.shards);
+            for i in 0..config.shards {
+                let (tx, rx) = crossbeam_channel::bounded::<WorkerMsg>(DEST_CHANNEL_CAPACITY);
+                let dests: ShardDests = Arc::new(ArcSwap::from_pointee(Vec::new()));
+                let core = config.shard_cores.get(i).copied();
+                let (shard_dests_i, metrics, exit) = (dests.clone(), metrics.clone(), exit.clone());
+                let hdl = Builder::new()
+                    .name(format!("ssPxyShard_{i}"))
+                    .spawn(move || run_send_shard(i, rx, shard_dests_i, core, metrics, exit))
+                    .expect("failed to spawn send shard");
+                owned.insert(shard_key(i), tx);
+                handles.push(hdl);
+                shard_dests.push(dests);
+            }
+            info!(
+                "send shards: {} (cores {:?}; pinned shards busy-poll)",
+                config.shards, config.shard_cores
+            );
+
+            let tick = crossbeam_channel::tick(DEST_RECONCILE_INTERVAL);
+            let mut current: Option<(Vec<SocketAddr>, Option<usize>)> = None;
+            while !exit.load(Ordering::Relaxed) {
+                let mut desired: Vec<SocketAddr> =
+                    unioned_dest_sockets.load().iter().copied().collect();
+                desired.sort();
+                desired.dedup();
+                let ports = config.balance_bond.as_deref().and_then(bond_ports);
+                if current.as_ref() != Some(&(desired.clone(), ports)) {
+                    if config.balance_bond.is_some() && ports.is_none() {
+                        warn!(
+                            "--balance-bond {:?}: not an 802.3ad/balance-xor bond with layer3+4 hash and 2+ ports up; not balancing",
+                            config.balance_bond
+                        );
+                    }
+                    reshard(&desired, &shard_dests, ports);
+                    metrics.worker_count.store(desired.len(), Ordering::Relaxed);
+                    if current.is_none() {
+                        dest_senders.store(Arc::new(owned.clone()));
+                    }
+                    current = Some((desired, ports));
+                }
+                crossbeam_channel::select! {
+                    recv(tick) -> _ => {}
+                    recv(shutdown_receiver) -> _ => break,
+                }
+            }
+
+            // Shutdown: drop all senders so shards see Disconnected and exit.
+            drop(owned);
+            dest_senders.store(Arc::new(DestSenderMap::default()));
+            for (i, h) in handles.into_iter().enumerate() {
+                if let Err(e) = h.join() {
+                    warn!("send shard {i} join failed: {e:?}");
+                }
+            }
+            info!("Exiting shard manager.");
+        })
+        .unwrap()
+}
+
+/// Assigns the destinations round-robin to the shards, each with a new
+/// socket. With `bond_ports`, the n-th balanced destination gets a source
+/// port that the bond's hash sends out on port n % bond_ports.
+fn reshard(desired: &[SocketAddr], shard_dests: &[ShardDests], bond_ports: Option<usize>) {
+    let n = shard_dests.len();
+    let mut per_shard: Vec<Vec<Arc<ShardDest>>> = vec![Vec::new(); n];
+    let mut slot = 0;
+    for (k, addr) in desired.iter().enumerate() {
+        let want = bond_ports.map(|p| (slot % p, p));
+        match new_dest_socket(addr, want) {
+            Ok((socket, balanced)) => {
+                let sport = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                if balanced {
+                    info!("send shard {}: {addr} from port {sport}, bond port {}", k % n, slot % bond_ports.unwrap_or(1));
+                    slot += 1;
+                } else {
+                    info!("send shard {}: {addr} from port {sport}", k % n);
+                }
+                per_shard[k % n].push(Arc::new(ShardDest { addr: *addr, socket }));
+            }
+            Err(e) => error!("send shard: no socket for {addr}, not sending to it: {e}"),
+        }
+    }
+    for (dests, assigned) in shard_dests.iter().zip(per_shard) {
+        dests.store(Arc::new(assigned));
+    }
+}
+
+/// A socket for sending to `dest`. With `bond = Some((slot, ports))`, bound to
+/// a source port that the bond's layer3+4 hash maps to port `slot` (IPv4,
+/// non-loopback only); returns whether that worked.
+fn new_dest_socket(
+    dest: &SocketAddr,
+    bond: Option<(usize, usize)>,
+) -> std::io::Result<(UdpSocket, bool)> {
+    let unspecified = match dest {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    if let (Some((slot, ports)), SocketAddr::V4(d)) = (bond, dest) {
+        // connect() on a UDP socket only resolves the route (no packet sent):
+        // it tells us the source address the kernel will use.
+        let probe = UdpSocket::bind(SocketAddr::new(unspecified, 0))?;
+        probe.connect(dest)?;
+        if let IpAddr::V4(src) = probe.local_addr()?.ip() {
+            if !src.is_loopback() {
+                drop(probe);
+                for sport in BALANCE_PORTS {
+                    if bond_l34_hash(src, sport, *d.ip(), d.port()) as usize % ports != slot {
+                        continue;
+                    }
+                    if let Ok(socket) = UdpSocket::bind(SocketAddr::new(unspecified, sport)) {
+                        return Ok((socket, true));
+                    }
+                }
+            }
+        }
+    }
+    Ok((UdpSocket::bind(SocketAddr::new(unspecified, 0))?, false))
+}
+
+/// The bonding driver's layer3+4 transmit hash for IPv4 UDP on a
+/// little-endian host (`bond_xmit_hash` / `bond_ip_hash`); the bond sends on
+/// port `hash % ports up`. Verify on a server with
+/// `fanout/scripts/bond-hash-check.py` before relying on it.
+fn bond_l34_hash(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16) -> u32 {
+    let [s0, s1] = sport.to_be_bytes();
+    let [d0, d1] = dport.to_be_bytes();
+    let mut h = u32::from_le_bytes([s0, s1, d0, d1]);
+    h ^= u32::from_le_bytes(dst.octets()) ^ u32::from_le_bytes(src.octets());
+    h ^= h >> 16;
+    h ^= h >> 8;
+    h >> 1
+}
+
+/// Ports up on `bond` if it spreads flows by layer3+4 hash over 2 or more.
+fn bond_ports(bond: &str) -> Option<usize> {
+    let read = |f: &str| std::fs::read_to_string(format!("/sys/class/net/{bond}/bonding/{f}")).ok();
+    let mode = read("mode")?;
+    if !(mode.starts_with("802.3ad") || mode.starts_with("balance-xor"))
+        || !read("xmit_hash_policy")?.starts_with("layer3+4")
+    {
+        return None;
+    }
+    let up = read("slaves")?
+        .split_whitespace()
+        .filter(|s| {
+            std::fs::read_to_string(format!("/sys/class/net/{s}/operstate"))
+                .map(|o| o.trim() == "up")
+                .unwrap_or(false)
+        })
+        .count();
+    (up >= 2).then_some(up)
+}
+
+/// The body of a send shard: for every batch, one `batch_send` (`sendmmsg`)
+/// per destination it owns. Pinned (`core`), it busy-polls its queue.
+fn run_send_shard(
+    id: usize,
+    rx: crossbeam_channel::Receiver<WorkerMsg>,
+    dests: ShardDests,
+    core: Option<usize>,
+    metrics: Arc<ShredMetrics>,
+    exit: Arc<AtomicBool>,
+) {
+    if let Some(core) = core {
+        pin_current_thread(core);
+    }
+    let spin = core.is_some();
+    let trace_on = log_enabled!(Level::Trace);
+    let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> =
+        Vec::with_capacity(DEST_SCRATCH_INITIAL_CAPACITY);
+
+    while !exit.load(Ordering::Relaxed) {
+        let (batch, trace) = if spin {
+            match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(TryRecvError::Empty) => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        let t_send = trace_on.then(Instant::now);
+
+        let snapshot = dests.load();
+        for dest in snapshot.iter() {
+            let addr: &SocketAddr = &dest.addr;
+            // SAFETY: `snapshot` keeps `dest` alive past the `scratch.clear()`
+            // below, so the 'static lifetime is a phantom that never escapes.
+            let addr_static: &'static SocketAddr = unsafe { std::mem::transmute(addr) };
+            for pkt in batch.iter() {
+                if let Some(data) = pkt.data(..) {
+                    // SAFETY: `batch` outlives this loop; `scratch` is cleared
+                    // before the iteration ends.
+                    let data_static: &'static [u8] = unsafe { std::mem::transmute(data) };
+                    scratch.push((data_static, addr_static));
+                }
+            }
+            let to_send = scratch.len() as u64;
+            match batch_send(&dest.socket, &scratch) {
+                Ok(()) => {
+                    metrics
+                        .success_forward
+                        .fetch_add(to_send, Ordering::Relaxed);
+                }
+                Err(SendPktsError::IoError(err, num_failed)) => {
+                    metrics
+                        .fail_forward
+                        .fetch_add(num_failed as u64, Ordering::Relaxed);
+                    metrics
+                        .success_forward
+                        .fetch_add(to_send.saturating_sub(num_failed as u64), Ordering::Relaxed);
+                    error!(
+                        "send shard {id} to {addr} failed batch of {to_send}: {num_failed} failed. Error: {err}"
+                    );
+                }
+            }
+            scratch.clear();
+        }
+        drop(snapshot);
+
+        if let Some(t) = t_send {
+            let send_us = t.elapsed().as_micros() as u64;
+            metrics.worker_batches.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .worker_send_us_sum
+                .fetch_add(send_us, Ordering::Relaxed);
+            metrics
+                .worker_packets_sent
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            update_max_atomic(&metrics.worker_send_us_max, send_us);
+        }
+        // E2E barrier, as in `run_dest_worker`: one decrement per shard.
+        if let Some(t) = trace {
+            let prev = t.workers_remaining.fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
+                let e2e_us = t.t_start.elapsed().as_micros() as u64;
+                metrics.e2e_batches.fetch_add(1, Ordering::Relaxed);
+                metrics.e2e_us_sum.fetch_add(e2e_us, Ordering::Relaxed);
+                update_max_atomic(&metrics.e2e_us_max, e2e_us);
+            }
+        }
+        drop(batch);
+    }
+    info!("Exiting send shard {id}.");
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_set(core: usize) -> libc::cpu_set_t {
+    // SAFETY: cpu_set_t is a plain bit set; all zeroes is the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a valid, exclusively borrowed cpu_set_t.
+    unsafe { libc::CPU_SET(core, &mut set) };
+    set
+}
+
+/// Pins the calling thread to `core`.
+#[cfg(target_os = "linux")]
+fn pin_current_thread(core: usize) {
+    let set = cpu_set(core);
+    // SAFETY: pid 0 means the calling thread; `set` is a valid cpu_set_t.
+    let r = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    if r == 0 {
+        info!("pinned {name} to CPU {core}");
+    } else {
+        warn!("could not pin {name} to CPU {core}: {}", std::io::Error::last_os_error());
+    }
+}
+
+/// Pins a running thread to `core`.
+#[cfg(target_os = "linux")]
+fn pin_thread(handle: &JoinHandle<()>, core: usize) {
+    use std::os::unix::thread::JoinHandleExt;
+    let set = cpu_set(core);
+    // SAFETY: the thread behind `handle` has not been joined, so its pthread_t
+    // is valid; `set` is a valid cpu_set_t.
+    let r = unsafe {
+        libc::pthread_setaffinity_np(
+            handle.as_pthread_t(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        )
+    };
+    if r == 0 {
+        info!("pinned {:?} to CPU {core}", handle.thread().name());
+    } else {
+        warn!(
+            "could not pin {:?} to CPU {core}: {}",
+            handle.thread().name(),
+            std::io::Error::from_raw_os_error(r)
+        );
+    }
+}
+
+/// Sets `SO_BUSY_POLL`: blocking receives poll the NIC queue for up to
+/// `usecs` before sleeping.
+#[cfg(target_os = "linux")]
+fn set_busy_poll(socket: &UdpSocket, usecs: u32) {
+    use std::os::fd::AsRawFd;
+    let v = usecs as libc::c_int;
+    // SAFETY: valid fd, option value points to a c_int of the given size.
+    let r = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        warn!("could not set SO_BUSY_POLL {usecs}: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(core: usize) {
+    warn!("CPU pinning is Linux only; not pinning to CPU {core}");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_thread(_handle: &JoinHandle<()>, core: usize) {
+    warn!("CPU pinning is Linux only; not pinning to CPU {core}");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_busy_poll(_socket: &UdpSocket, usecs: u32) {
+    warn!("SO_BUSY_POLL is Linux only; not setting {usecs}");
 }
 
 /// Receives a `PacketBatch` from a listener thread, deduplicates it, updates
