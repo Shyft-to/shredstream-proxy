@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests the kernel dedup filter's fail-open and TO_PORT behaviour in a
 # throwaway network namespace (veth pair 198.18.9.1 <-> 198.18.9.2, test
-# ports 41001/41002). Never touches bond0 or any production port; the
+# ports 41001/41002, standby 41003). Never touches bond0 or any production port; the
 # namespace is removed on exit. Run as root from the repository:
 #
 #   fanout/scripts/dedup-failover-test.sh
@@ -12,10 +12,13 @@
 #   2  first port's forwarder down        -> other port gets N (late, not lost)
 #   3  TO_PORT=41001, copies hit 41002 first, both up   -> 41001 gets N, 41002 0
 #   4  TO_PORT=41001, 41001 down          -> 41002 gets N
+#   5  TO_PORT=41001 STANDBY_PORT=41003, all up        -> 41001 gets N
+#   6  TO_PORT=41001 STANDBY_PORT=41003, 41001 down    -> 41003 gets N
+#   7  TO_PORT=41001 STANDBY_PORT=41003, 41001 and 41003 down -> 41002 gets N
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-NS=dedupt N=500 A=41001 B=41002
+NS=dedupt N=500 A=41001 B=41002 C=41003
 export OBJ=/run/fanout-dedup-test.bpf.o
 
 cleanup() {
@@ -74,8 +77,9 @@ EOF
 
 fails=0
 run_case() {
-    local name=$1 to_port=$2 first=$3 second=$4 listeners=$5 expect_port=$6 out got other
-    ip netns exec "$NS" env DEV=dt1 TO_PORT="$to_port" "$DIR/dedup.sh" attach "$A,$B" >/dev/null
+    local name=$1 to_port=$2 first=$3 second=$4 listeners=$5 expect_port=$6 standby=${7:-} out got other
+    ip netns exec "$NS" env DEV=dt1 TO_PORT="$to_port" STANDBY_PORT="$standby" \
+        "$DIR/dedup.sh" attach "$A,$B" >/dev/null
     out=$(mktemp)
     # shellcheck disable=SC2086
     receive $listeners >"$out"
@@ -98,5 +102,8 @@ run_case 1 "" "$A" "$B" "$A $B" "$A"
 run_case 2 "" "$A" "$B" "$B" "$B"
 run_case 3 "$A" "$B" "$A" "$A $B" "$A"
 run_case 4 "$A" "$B" "$A" "$B" "$B"
+run_case 5 "$A" "$B" "$A" "$A $B $C" "$A" "$C"
+run_case 6 "$A" "$B" "$A" "$B $C" "$C" "$C"
+run_case 7 "$A" "$B" "$A" "$B" "$B" "$C"
 
 [ "$fails" -eq 0 ] && echo "RESULT: all cases passed" || { echo "RESULT: $fails case(s) failed"; exit 1; }

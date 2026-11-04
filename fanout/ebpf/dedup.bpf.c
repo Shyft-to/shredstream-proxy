@@ -14,8 +14,12 @@
  * to port p instead (UDP destination port and checksum rewritten), so a
  * single forwarder on p receives every shred once.
  *
+ * -DSTANDBY_PORT=s: if no socket is bound to the target port (the primary
+ * forwarder is down or restarting), first copies go to port s instead, a
+ * standby forwarder with the same destinations that otherwise idles.
+ *
  * Fail-open: a first copy only counts as delivered if a socket is bound to
- * the port it is going to. If none is (its forwarder died or is
+ * the port it is going to (or to the standby). If none is (its forwarder died or is
  * restarting), the copy passes untouched and is not recorded, so the next
  * copy of that shred, from another source to another forwarder, still gets
  * through: late instead of lost.
@@ -45,6 +49,9 @@
 #ifndef TO_PORT
 #define TO_PORT 0
 #endif
+#ifndef STANDBY_PORT
+#define STANDBY_PORT 0
+#endif
 
 /* Identity of a shred: signature (64), variant, slot, index, version,
  * fec_set_index (83 bytes), plus the next 5 header bytes. Identical in every
@@ -72,8 +79,9 @@ enum {
 	STAT_DUPLICATE, /* later copy, dropped */
 	STAT_SHORT,     /* watched port, but too short to be a shred: passed */
 	STAT_ERROR,     /* map update failed for another reason: passed */
-	STAT_MOVED,     /* first copy passed on to TO_PORT (counted in FIRST too) */
-	STAT_NO_SOCKET, /* no forwarder on the target port: passed, not recorded */
+	STAT_MOVED,     /* first copy's port rewritten (counted in FIRST too) */
+	STAT_NO_SOCKET, /* no forwarder on the target port or standby: passed, not recorded */
+	STAT_STANDBY,   /* target port had no forwarder, sent to STANDBY_PORT (in FIRST too) */
 	STAT_MAX,
 };
 
@@ -160,12 +168,17 @@ int dedup(struct __sk_buff *skb)
 
 		/* Checked after the insert, so duplicates pay nothing extra. */
 		if (!has_socket(skb, &ip, &udp, to)) {
-			bpf_map_delete_elem(&dedup_seen, &key);
-			count(STAT_NO_SOCKET);
-			return TC_ACT_OK;
+			if (STANDBY_PORT && has_socket(skb, &ip, &udp, bpf_htons(STANDBY_PORT))) {
+				to = bpf_htons(STANDBY_PORT);
+				count(STAT_STANDBY);
+			} else {
+				bpf_map_delete_elem(&dedup_seen, &key);
+				count(STAT_NO_SOCKET);
+				return TC_ACT_OK;
+			}
 		}
 		count(STAT_FIRST);
-		if (TO_PORT && port != TO_PORT) {
+		if (to != udp.dest) {
 			/* The port and the checksum change by opposite amounts, so a
 			 * checksum the NIC already computed over the packet stays valid;
 			 * a zero (absent) UDP checksum stays zero. */
