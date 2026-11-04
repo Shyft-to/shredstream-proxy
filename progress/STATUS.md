@@ -57,6 +57,11 @@ spread bursts over CPUs.
 
 ## Key findings
 
+0. **Fra (2026-11-04): on 2 × 10 Gb/s the p99 is the wire, not software.**
+   A zero-cost forwarder replayed on real arrivals has p99 1,283 µs; the
+   live tuned proxy measures 1,267. 25 Gb/s links: floor p99 ~49 µs.
+   Sending data shreds before coding shreds: data-shred p99 213 µs on the
+   same 10 Gb/s links (chapter 7).
 1. **Kernel fan-out cuts the tail 7.5×.** One eBPF program on `bond0`
    receive drops duplicate copies and clones each shred directly to all 15
    destinations. Against kernel dedup + 3 proxies (6 vs 6): p99 2.35 →
@@ -159,4 +164,4 @@ spread bursts over CPUs.
 | [4](chapter-04-2026-10-19.md) | 2026-10-19 | Local-delivery fix tested end to end; capture-free exact box latency (`probe.sh latency`: NIC-driver stamp → in-kernel histograms) |
 | [5](chapter-05-2026-11-02.md) | 2026-11-02 | Fra rollout: survey (31 destinations, 6 dead), baseline p99 2.56 ms, kfan live (up to 32 destinations): p99 373 µs (low end) |
 | [6](chapter-06-2026-11-03.md) | 2026-11-03 | Fra rolled back; kfan modelled on real arrivals: one CPU is worse than the proxies (node FEC sets +1.2 ms, matches geyserbench); probe numbers were an artifact |
-| [7](chapter-07-2026-11-04.md) | 2026-11-04 | Fra: one tuned proxy behind kernel dedup with an idle standby (failover drills lost nothing); proxy's own dedup caused ~1 lost shred/min, now off; p50 179 → ~56 µs, p99 2.56 → ~1.24 ms vs baseline |
+| [7](chapter-07-2026-11-04.md) | 2026-11-04 | Fra: one tuned proxy behind kernel dedup with an idle standby (failover drills lost nothing); proxy's own dedup caused ~1 lost shred/min, now off; p50 179 → ~56 µs, p99 2.56 → ~1.24 ms vs baseline; the remaining p99 is the 2 × 10 Gb/s wire (floor model), 25 Gb/s floor p99 ~49 µs |
