@@ -156,9 +156,15 @@ struct CommonArgs {
     #[arg(long, env, value_delimiter = ',')]
     send_cores: Vec<usize>,
 
-    /// CPU to pin the listen and dispatch threads to.
+    /// CPU to pin the listen threads to.
     #[arg(long, env)]
     recv_core: Option<usize>,
+
+    /// CPU to pin the dispatch thread to (dedup + hand-off to the senders);
+    /// it then busy-polls instead of sleeping (one full core). Requires
+    /// `--num-threads 1`, so that exactly one dispatch thread spins.
+    #[arg(long, env)]
+    dispatch_core: Option<usize>,
 
     /// Socket busy polling on the listen sockets, in microseconds
     /// (`SO_BUSY_POLL`). 0 = off.
@@ -267,6 +273,9 @@ fn main() -> Result<(), ShredstreamProxyError> {
     if !args.send_cores.is_empty() && args.send_cores.len() != args.send_shards {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--send-cores must list exactly one CPU per --send-shards.")));
     }
+    if args.dispatch_core.is_some() && args.num_threads != Some(1) {
+        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--dispatch-core requires --num-threads 1 (one spinning dispatch thread).")));
+    }
     if args.balance_bond.is_some() && args.send_shards == 0 {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--balance-bond requires --send-shards.")));
     }
@@ -347,6 +356,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
             shards: args.send_shards,
             shard_cores: args.send_cores.clone(),
             recv_core: args.recv_core,
+            dispatch_core: args.dispatch_core,
             recv_busy_poll_us: args.recv_busy_poll_us,
             balance_bond: args.balance_bond.clone(),
         },

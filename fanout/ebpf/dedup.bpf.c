@@ -9,7 +9,12 @@
  *
  * Everything that is not IPv4/UDP to a watched port passes untouched.
  * Watched ports are fixed at build time: -DPORT_A=... [-DPORT_B ... -DPORT_D].
+ *
+ * -DTO_PORT=p: first copies arriving on another watched port are passed on
+ * to port p instead (UDP destination port and checksum rewritten), so a
+ * single forwarder on p receives every shred once.
  */
+#include <stddef.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/in.h>
@@ -30,6 +35,9 @@
 #endif
 #ifndef PORT_D
 #define PORT_D 0
+#endif
+#ifndef TO_PORT
+#define TO_PORT 0
 #endif
 
 /* Identity of a shred: signature (64), variant, slot, index, version,
@@ -58,6 +66,7 @@ enum {
 	STAT_DUPLICATE, /* later copy, dropped */
 	STAT_SHORT,     /* watched port, but too short to be a shred: passed */
 	STAT_ERROR,     /* map update failed for another reason: passed */
+	STAT_MOVED,     /* first copy passed on to TO_PORT (counted in FIRST too) */
 	STAT_MAX,
 };
 
@@ -123,6 +132,17 @@ int dedup(struct __sk_buff *skb)
 	ret = bpf_map_update_elem(&dedup_seen, &key, &port, BPF_NOEXIST);
 	if (ret == 0) {
 		count(STAT_FIRST);
+		if (TO_PORT && port != TO_PORT) {
+			__be16 to = bpf_htons(TO_PORT);
+
+			/* The port and the checksum change by opposite amounts, so a
+			 * checksum the NIC already computed over the packet stays valid;
+			 * a zero (absent) UDP checksum stays zero. */
+			bpf_l4_csum_replace(skb, l4 + offsetof(struct udphdr, check), udp.dest, to,
+					    BPF_F_MARK_MANGLED_0 | sizeof(to));
+			bpf_skb_store_bytes(skb, l4 + offsetof(struct udphdr, dest), &to, sizeof(to), 0);
+			count(STAT_MOVED);
+		}
 		return TC_ACT_OK;
 	}
 	if (ret == -EEXIST) {

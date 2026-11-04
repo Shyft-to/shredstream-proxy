@@ -101,8 +101,11 @@ pub struct SendConfig {
     /// CPU per shard, in shard order. A pinned shard busy-polls its queue
     /// instead of sleeping (one full core each).
     pub shard_cores: Vec<usize>,
-    /// CPU for the listen and dispatch threads.
+    /// CPU for the listen threads.
     pub recv_core: Option<usize>,
+    /// CPU for the dispatch thread (dedup + hand-off to the senders); pinned,
+    /// it busy-polls the listen thread's channel instead of sleeping.
+    pub dispatch_core: Option<usize>,
     /// `SO_BUSY_POLL` (µs) on the listen sockets; 0 = off.
     pub recv_busy_poll_us: u32,
     /// Bond (layer3+4 hash) whose ports the destinations should be spread
@@ -154,6 +157,7 @@ pub fn start_forwarder_threads(
             .for_each(|s| set_busy_poll(s, send_config.recv_busy_poll_us));
     }
     let recv_core = send_config.recv_core;
+    let dispatch_core = send_config.dispatch_core;
 
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
@@ -270,32 +274,55 @@ pub fn start_forwarder_threads(
             let send_thread = Builder::new()
                 .name(format!("ssPxyTx_{thread_id}"))
                 .spawn(move || {
-                    if let Some(core) = recv_core {
+                    if let Some(core) = dispatch_core {
+                        // Pinned: busy-poll the channel (no wake-up per batch).
                         pin_current_thread(core);
-                    }
-                    while !exit.load(Ordering::Relaxed) {
-                        crossbeam_channel::select! {
-                            // forward packets
-                            recv(packet_receiver) -> maybe_packet_batch => {
-                                let res = recv_from_channel_and_send_multiple_dest(
-                                    maybe_packet_batch,
-                                    &deduper,
-                                    &dest_senders,
-                                    should_reconstruct_shreds,
-                                    &reconstruct_tx,
-                                    debug_trace_shred,
-                                    &metrics,
-                                );
+                        while !exit.load(Ordering::Relaxed) {
+                            match packet_receiver.try_recv() {
+                                Ok(packet_batch) => {
+                                    if recv_from_channel_and_send_multiple_dest(
+                                        Ok(packet_batch),
+                                        &deduper,
+                                        &dest_senders,
+                                        should_reconstruct_shreds,
+                                        &reconstruct_tx,
+                                        debug_trace_shred,
+                                        &metrics,
+                                    )
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                                Err(TryRecvError::Disconnected) => break,
+                            }
+                        }
+                    } else {
+                        while !exit.load(Ordering::Relaxed) {
+                            crossbeam_channel::select! {
+                                // forward packets
+                                recv(packet_receiver) -> maybe_packet_batch => {
+                                    let res = recv_from_channel_and_send_multiple_dest(
+                                        maybe_packet_batch,
+                                        &deduper,
+                                        &dest_senders,
+                                        should_reconstruct_shreds,
+                                        &reconstruct_tx,
+                                        debug_trace_shred,
+                                        &metrics,
+                                    );
 
-                                // If the channel is closed or error, break out
-                                if res.is_err() {
+                                    // If the channel is closed or error, break out
+                                    if res.is_err() {
+                                        break;
+                                    }
+                                }
+
+                                // handle shutdown (avoid using sleep since it can hang)
+                                recv(shutdown_receiver) -> _ => {
                                     break;
                                 }
-                            }
-
-                            // handle shutdown (avoid using sleep since it can hang)
-                            recv(shutdown_receiver) -> _ => {
-                                break;
                             }
                         }
                     }

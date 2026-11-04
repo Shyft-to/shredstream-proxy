@@ -3,7 +3,8 @@
 # Run as root. Needs: clang, llvm, libbpf-dev, bpftool, tc.
 #
 # Usage:
-#   dedup.sh attach PORTS     build for PORTS (comma separated, up to 4) and attach
+#   dedup.sh attach PORTS     build for PORTS (comma separated, up to 4) and attach;
+#                             TO_PORT=p: pass every first copy on to port p (one forwarder)
 #   dedup.sh detach           remove the filter (instant, no restart of anything)
 #   dedup.sh status           attached or not, and the counters
 #   dedup.sh cost [SECONDS]   measured kernel CPU time per packet (default 10 s)
@@ -27,6 +28,11 @@ build() {
         defs+=("-DPORT_${names[$i]}=$p")
         i=$((i + 1))
     done
+    if [ -n "${TO_PORT:-}" ]; then
+        [[ "$TO_PORT" =~ ^[0-9]+$ ]] && [[ ",$ports," == *",$TO_PORT,"* ]] ||
+            { echo "TO_PORT must be one of PORTS" >&2; exit 1; }
+        defs+=("-DTO_PORT=$TO_PORT")
+    fi
     clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include/x86_64-linux-gnu \
         "${defs[@]}" -c "$SRC" -o "$OBJ"
 }
@@ -38,7 +44,7 @@ attach() {
     # clsact only adds ingress/egress hooks; it does not replace the root qdisc.
     tc qdisc show dev "$DEV" | grep -q clsact || tc qdisc add dev "$DEV" clsact
     tc filter add dev "$DEV" ingress pref "$PREF" handle 1 bpf direct-action obj "$OBJ" sec tc
-    echo "attached on $DEV ingress for ports $1"
+    echo "attached on $DEV ingress for ports $1${TO_PORT:+, first copies passed on to $TO_PORT}"
 }
 
 detach() {
@@ -53,7 +59,7 @@ detach() {
 counters() {
     bpftool -j map dump name dedup_stats 2>/dev/null | python3 -c '
 import json, sys
-names = ["first (passed)", "duplicate (dropped)", "too short (passed)", "error (passed)"]
+names = ["first (passed)", "duplicate (dropped)", "too short (passed)", "error (passed)", "moved to TO_PORT"]
 def num(v):  # bpftool prints either a number or little-endian hex bytes
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:
