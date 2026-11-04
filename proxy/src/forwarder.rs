@@ -112,6 +112,9 @@ pub struct SendConfig {
     pub dispatch_core: Option<usize>,
     /// `SO_BUSY_POLL` (µs) on the listen sockets; 0 = off.
     pub recv_busy_poll_us: u32,
+    /// Receive buffer (bytes) of each listen socket, set with
+    /// `SO_RCVBUFFORCE` (ignores `net.core.rmem_max`); 0 = system default.
+    pub recv_buffer_bytes: usize,
     /// Bond (layer3+4 hash) whose ports the destinations should be spread
     /// over evenly, by choosing each destination's source port.
     pub balance_bond: Option<String>,
@@ -159,6 +162,11 @@ pub fn start_forwarder_threads(
         sockets
             .iter()
             .for_each(|s| set_busy_poll(s, send_config.recv_busy_poll_us));
+    }
+    if send_config.recv_buffer_bytes > 0 {
+        sockets
+            .iter()
+            .for_each(|s| set_recv_buffer(s, send_config.recv_buffer_bytes));
     }
     let recv_core = send_config.recv_core;
     let dispatch_core = send_config.dispatch_core;
@@ -971,6 +979,82 @@ fn set_busy_poll(socket: &UdpSocket, usecs: u32) {
     if r != 0 {
         warn!("could not set SO_BUSY_POLL {usecs}: {}", std::io::Error::last_os_error());
     }
+}
+
+/// Sets the receive buffer to `bytes` with `SO_RCVBUFFORCE` (needs
+/// CAP_NET_ADMIN; not capped by `net.core.rmem_max`).
+#[cfg(target_os = "linux")]
+fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
+    use std::os::fd::AsRawFd;
+    let v = bytes.min(libc::c_int::MAX as usize / 2) as libc::c_int;
+    // SAFETY: valid fd, option value points to a c_int of the given size.
+    let r = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUFFORCE,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        info!("listen socket receive buffer {bytes} bytes");
+    } else {
+        warn!("could not set receive buffer {bytes}: {}", std::io::Error::last_os_error());
+    }
+}
+
+/// Keeps the calling thread, and every thread it spawns afterwards, off
+/// `cores` and their SMT siblings, so the threads pinned there have their
+/// physical cores to themselves. Call before spawning anything.
+#[cfg(target_os = "linux")]
+pub fn keep_off_cores(cores: &[usize]) {
+    let mut off: Vec<usize> = Vec::new();
+    for &core in cores {
+        off.push(core);
+        // e.g. "14,30" or "14-15"
+        let path = format!("/sys/devices/system/cpu/cpu{core}/topology/thread_siblings_list");
+        for part in std::fs::read_to_string(path).unwrap_or_default().trim().split(',') {
+            let mut ends = part.split('-').filter_map(|n| n.parse::<usize>().ok());
+            if let Some(lo) = ends.next() {
+                off.extend(lo..=ends.next().unwrap_or(lo));
+            }
+        }
+    }
+    off.sort_unstable();
+    off.dedup();
+    // SAFETY: cpu_set_t is a plain bit set; pid 0 is the calling thread.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    if unsafe { libc::sched_getaffinity(0, size, &mut set) } != 0 {
+        warn!("could not read CPU affinity: {}", std::io::Error::last_os_error());
+        return;
+    }
+    for &core in &off {
+        // SAFETY: `set` is a valid, exclusively borrowed cpu_set_t.
+        unsafe { libc::CPU_CLR(core, &mut set) };
+    }
+    // SAFETY: as above.
+    if unsafe { libc::CPU_COUNT(&set) } == 0 {
+        warn!("not keeping threads off CPUs {off:?}: no CPU would be left");
+        return;
+    }
+    // SAFETY: pid 0 means the calling thread; `set` is a valid cpu_set_t.
+    if unsafe { libc::sched_setaffinity(0, size, &set) } == 0 {
+        info!("other threads kept off CPUs {off:?}");
+    } else {
+        warn!("could not keep threads off CPUs {off:?}: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn keep_off_cores(cores: &[usize]) {
+    warn!("CPU pinning is Linux only; not keeping threads off CPUs {cores:?}");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_recv_buffer(_socket: &UdpSocket, bytes: usize) {
+    warn!("SO_RCVBUFFORCE is Linux only; not setting {bytes}");
 }
 
 #[cfg(not(target_os = "linux"))]

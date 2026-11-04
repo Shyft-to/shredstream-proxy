@@ -210,9 +210,10 @@ forwarder thread.
 | `RUST_LOG=...forwarder=trace` | off | Gates ALL perf instrumentation, including `avg_end_to_end_us`. Zero runtime cost when off (no `Instant::now`, no atomic updates, no `BatchTrace` allocation). |
 | `--send-shards <N>` | `0` (one worker per destination) | N sender threads, each owning a share of the destinations (round-robin); one `sendmmsg` per destination per batch. Added 2026-11 for Fra (see `progress/chapter-06`). |
 | `--send-cores c1,..` | none | One CPU per shard. A pinned shard busy-polls its queue (100% of that core). Unpinned shards sleep on their channel. |
-| `--recv-core <c>` | none | Pins the listen threads to one CPU. |
+| `--recv-core <c>` | none | Pins the listen threads to one CPU. With `--dispatch-core`, all other proxy threads are kept off both CPUs and their SMT siblings. |
 | `--dispatch-core <c>` | none | Pins the dispatch thread (dedup + hand-off) to one CPU, where it busy-polls instead of sleeping (one full core). Requires `--num-threads 1`. |
 | `--recv-busy-poll-us <us>` | `0` | `SO_BUSY_POLL` on the listen sockets. |
+| `--recv-buffer-bytes <n>` | `0` | Receive buffer of each listen socket (`SO_RCVBUFFORCE`); 0 = system default. |
 | `--send-spin-us <us>` | `0` | With `--send-shards`: unpinned senders poll their queue this long after each batch before sleeping; in bursts the dispatch thread then never wakes them. |
 | `--balance-bond <dev>` | none | With `--send-shards`: chooses each destination's source port so the bond's layer3+4 hash spreads destinations evenly over its ports (Fra: 15 of 23 were on one 10 Gb/s port). Check the hash with `fanout/scripts/bond-hash-check.py` first. |
 

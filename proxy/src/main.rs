@@ -177,6 +177,11 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = 0)]
     recv_busy_poll_us: u32,
 
+    /// Receive buffer of each listen socket, in bytes (`SO_RCVBUFFORCE`, not
+    /// capped by `net.core.rmem_max`). 0 = system default.
+    #[arg(long, env, default_value_t = 0)]
+    recv_buffer_bytes: usize,
+
     /// With `--send-shards`: bond device whose layer3+4 hash should spread the
     /// destinations evenly over its ports; each destination's source port is
     /// chosen accordingly. Eg. `bond0`.
@@ -286,6 +291,13 @@ fn main() -> Result<(), ShredstreamProxyError> {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--balance-bond requires --send-shards.")));
     }
 
+    // Before any thread exists, so that all of them inherit it: only the
+    // pinned listen/dispatch threads may run on those cores.
+    let hot_cores: Vec<usize> = args.recv_core.into_iter().chain(args.dispatch_core).collect();
+    if !hot_cores.is_empty() {
+        forwarder::keep_off_cores(&hot_cores);
+    }
+
     let exit = Arc::new(AtomicBool::new(false));
     let (shutdown_sender, shutdown_receiver) =
         shutdown_notifier(exit.clone()).expect("Failed to set up signal handler");
@@ -365,6 +377,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
             recv_core: args.recv_core,
             dispatch_core: args.dispatch_core,
             recv_busy_poll_us: args.recv_busy_poll_us,
+            recv_buffer_bytes: args.recv_buffer_bytes,
             balance_bond: args.balance_bond.clone(),
         },
     );
