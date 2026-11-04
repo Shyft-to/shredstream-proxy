@@ -14,7 +14,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$DIR/../ebpf/dedup.bpf.c"
-OBJ=/run/fanout-dedup.bpf.o
+OBJ=${OBJ:-/run/fanout-dedup.bpf.o}
 DEV=${DEV:-bond0}
 PREF=7700 # tc filter priority that identifies our filter
 
@@ -59,7 +59,8 @@ detach() {
 counters() {
     bpftool -j map dump name dedup_stats 2>/dev/null | python3 -c '
 import json, sys
-names = ["first (passed)", "duplicate (dropped)", "too short (passed)", "error (passed)", "moved to TO_PORT"]
+names = ["first (passed)", "duplicate (dropped)", "too short (passed)", "error (passed)", "moved to TO_PORT",
+         "no forwarder (passed)"]
 def num(v):  # bpftool prints either a number or little-endian hex bytes
     return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
 try:

@@ -13,6 +13,12 @@
  * -DTO_PORT=p: first copies arriving on another watched port are passed on
  * to port p instead (UDP destination port and checksum rewritten), so a
  * single forwarder on p receives every shred once.
+ *
+ * Fail-open: a first copy only counts as delivered if a socket is bound to
+ * the port it is going to. If none is (its forwarder died or is
+ * restarting), the copy passes untouched and is not recorded, so the next
+ * copy of that shred, from another source to another forwarder, still gets
+ * through: late instead of lost.
  */
 #include <stddef.h>
 #include <linux/bpf.h>
@@ -67,6 +73,7 @@ enum {
 	STAT_SHORT,     /* watched port, but too short to be a shred: passed */
 	STAT_ERROR,     /* map update failed for another reason: passed */
 	STAT_MOVED,     /* first copy passed on to TO_PORT (counted in FIRST too) */
+	STAT_NO_SOCKET, /* no forwarder on the target port: passed, not recorded */
 	STAT_MAX,
 };
 
@@ -83,6 +90,24 @@ static __always_inline void count(__u32 i)
 
 	if (v)
 		(*v)++;
+}
+
+/* Is a UDP socket bound to port `dport` for this packet's destination? */
+static __always_inline int has_socket(struct __sk_buff *skb, struct iphdr *ip,
+				      struct udphdr *udp, __be16 dport)
+{
+	struct bpf_sock_tuple t = {};
+	struct bpf_sock *sk;
+
+	t.ipv4.saddr = ip->saddr;
+	t.ipv4.daddr = ip->daddr;
+	t.ipv4.sport = udp->source;
+	t.ipv4.dport = dport;
+	sk = bpf_sk_lookup_udp(skb, &t, sizeof(t.ipv4), BPF_F_CURRENT_NETNS, 0);
+	if (!sk)
+		return 0;
+	bpf_sk_release(sk);
+	return 1;
 }
 
 static __always_inline int watched(__u16 port)
@@ -131,10 +156,16 @@ int dedup(struct __sk_buff *skb)
 	 * sources are processed on different CPUs at the same time. */
 	ret = bpf_map_update_elem(&dedup_seen, &key, &port, BPF_NOEXIST);
 	if (ret == 0) {
+		__be16 to = TO_PORT ? bpf_htons(TO_PORT) : udp.dest;
+
+		/* Checked after the insert, so duplicates pay nothing extra. */
+		if (!has_socket(skb, &ip, &udp, to)) {
+			bpf_map_delete_elem(&dedup_seen, &key);
+			count(STAT_NO_SOCKET);
+			return TC_ACT_OK;
+		}
 		count(STAT_FIRST);
 		if (TO_PORT && port != TO_PORT) {
-			__be16 to = bpf_htons(TO_PORT);
-
 			/* The port and the checksum change by opposite amounts, so a
 			 * checksum the NIC already computed over the packet stays valid;
 			 * a zero (absent) UDP checksum stays zero. */
