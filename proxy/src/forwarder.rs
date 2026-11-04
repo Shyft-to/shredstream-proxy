@@ -101,6 +101,10 @@ pub struct SendConfig {
     /// CPU per shard, in shard order. A pinned shard busy-polls its queue
     /// instead of sleeping (one full core each).
     pub shard_cores: Vec<usize>,
+    /// Unpinned shards keep polling their queue for this long (µs) after
+    /// their last batch before sleeping, so in bursts they are never woken;
+    /// 0 = sleep at once.
+    pub shard_spin_us: u32,
     /// CPU for the listen threads.
     pub recv_core: Option<usize>,
     /// CPU for the dispatch thread (dedup + hand-off to the senders); pinned,
@@ -634,18 +638,21 @@ fn start_shard_manager_thread(
                 let (tx, rx) = crossbeam_channel::bounded::<WorkerMsg>(DEST_CHANNEL_CAPACITY);
                 let dests: ShardDests = Arc::new(ArcSwap::from_pointee(Vec::new()));
                 let core = config.shard_cores.get(i).copied();
+                let spin_for = Duration::from_micros(config.shard_spin_us.into());
                 let (shard_dests_i, metrics, exit) = (dests.clone(), metrics.clone(), exit.clone());
                 let hdl = Builder::new()
                     .name(format!("ssPxyShard_{i}"))
-                    .spawn(move || run_send_shard(i, rx, shard_dests_i, core, metrics, exit))
+                    .spawn(move || {
+                        run_send_shard(i, rx, shard_dests_i, core, spin_for, metrics, exit)
+                    })
                     .expect("failed to spawn send shard");
                 owned.insert(shard_key(i), tx);
                 handles.push(hdl);
                 shard_dests.push(dests);
             }
             info!(
-                "send shards: {} (cores {:?}; pinned shards busy-poll)",
-                config.shards, config.shard_cores
+                "send shards: {} (cores {:?}; pinned shards busy-poll; others spin {} us before sleeping)",
+                config.shards, config.shard_cores, config.shard_spin_us
             );
 
             let tick = crossbeam_channel::tick(DEST_RECONCILE_INTERVAL);
@@ -791,6 +798,7 @@ fn run_send_shard(
     rx: crossbeam_channel::Receiver<WorkerMsg>,
     dests: ShardDests,
     core: Option<usize>,
+    spin_for: Duration,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
 ) {
@@ -798,6 +806,7 @@ fn run_send_shard(
         pin_current_thread(core);
     }
     let spin = core.is_some();
+    let mut idle_since = Instant::now();
     let trace_on = log_enabled!(Level::Trace);
     let mut scratch: Vec<(&'static [u8], &'static SocketAddr)> =
         Vec::with_capacity(DEST_SCRATCH_INITIAL_CAPACITY);
@@ -813,10 +822,20 @@ fn run_send_shard(
                 Err(TryRecvError::Disconnected) => break,
             }
         } else {
-            match rx.recv_timeout(Duration::from_millis(250)) {
+            // A polling receiver is not parked, so the dispatcher's send
+            // needs no wake-up; only after `spin_for` idle does it sleep.
+            match rx.try_recv() {
                 Ok(msg) => msg,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(TryRecvError::Empty) if idle_since.elapsed() < spin_for => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                Err(TryRecvError::Empty) => match rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(msg) => msg,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                },
+                Err(TryRecvError::Disconnected) => break,
             }
         };
         let t_send = trace_on.then(Instant::now);
@@ -880,6 +899,7 @@ fn run_send_shard(
             }
         }
         drop(batch);
+        idle_since = Instant::now();
     }
     info!("Exiting send shard {id}.");
 }

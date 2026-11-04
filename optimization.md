@@ -213,6 +213,7 @@ forwarder thread.
 | `--recv-core <c>` | none | Pins the listen threads to one CPU. |
 | `--dispatch-core <c>` | none | Pins the dispatch thread (dedup + hand-off) to one CPU, where it busy-polls instead of sleeping (one full core). Requires `--num-threads 1`. |
 | `--recv-busy-poll-us <us>` | `0` | `SO_BUSY_POLL` on the listen sockets. |
+| `--send-spin-us <us>` | `0` | With `--send-shards`: unpinned senders poll their queue this long after each batch before sleeping; in bursts the dispatch thread then never wakes them. |
 | `--balance-bond <dev>` | none | With `--send-shards`: chooses each destination's source port so the bond's layer3+4 hash spreads destinations evenly over its ports (Fra: 15 of 23 were on one 10 Gb/s port). Check the hash with `fanout/scripts/bond-hash-check.py` first. |
 
 ### The end-to-end metric (kept)

@@ -156,6 +156,12 @@ struct CommonArgs {
     #[arg(long, env, value_delimiter = ',')]
     send_cores: Vec<usize>,
 
+    /// With `--send-shards`: unpinned sender threads keep polling their queue
+    /// for this many microseconds after each batch before sleeping, so in
+    /// bursts the dispatch thread never has to wake them. 0 = sleep at once.
+    #[arg(long, env, default_value_t = 0)]
+    send_spin_us: u32,
+
     /// CPU to pin the listen threads to.
     #[arg(long, env)]
     recv_core: Option<usize>,
@@ -355,6 +361,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         forwarder::SendConfig {
             shards: args.send_shards,
             shard_cores: args.send_cores.clone(),
+            shard_spin_us: args.send_spin_us,
             recv_core: args.recv_core,
             dispatch_core: args.dispatch_core,
             recv_busy_poll_us: args.recv_busy_poll_us,
