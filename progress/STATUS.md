@@ -159,4 +159,4 @@ spread bursts over CPUs.
 | [4](chapter-04-2026-10-19.md) | 2026-10-19 | Local-delivery fix tested end to end; capture-free exact box latency (`probe.sh latency`: NIC-driver stamp → in-kernel histograms) |
 | [5](chapter-05-2026-11-02.md) | 2026-11-02 | Fra rollout: survey (31 destinations, 6 dead), baseline p99 2.56 ms, kfan live (up to 32 destinations): p99 373 µs (low end) |
 | [6](chapter-06-2026-11-03.md) | 2026-11-03 | Fra rolled back; kfan modelled on real arrivals: one CPU is worse than the proxies (node FEC sets +1.2 ms, matches geyserbench); probe numbers were an artifact |
-| [7](chapter-07-2026-11-04.md) | 2026-11-04 | Failover for one busy-looping proxy: dedup sends first copies to an idle standby port while the primary has no socket (built, untested) |
+| [7](chapter-07-2026-11-04.md) | 2026-11-04 | One busy-looping proxy behind dedup with an idle standby (failover drill: nothing lost): p99 −16.6% vs 23 shards (1,364 µs, 5 runs), p50 97 µs |
