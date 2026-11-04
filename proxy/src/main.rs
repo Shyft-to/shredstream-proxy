@@ -162,6 +162,13 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = 0)]
     send_spin_us: u32,
 
+    /// With `--send-shards`: send each batch's data shreds before its coding
+    /// shreds, at a higher socket priority, so that a priority qdisc on the
+    /// NIC ports (`fanout/scripts/prio-qdisc.sh`) sends waiting data shreds
+    /// first when the wire is busy.
+    #[arg(long, env, default_value_t = false, action = clap::ArgAction::Set)]
+    data_first: bool,
+
     /// CPU to pin the listen threads to.
     #[arg(long, env)]
     recv_core: Option<usize>,
@@ -294,6 +301,9 @@ fn main() -> Result<(), ShredstreamProxyError> {
     if args.dispatch_core.is_some() && args.num_threads != Some(1) {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--dispatch-core requires --num-threads 1 (one spinning dispatch thread).")));
     }
+    if args.data_first && args.send_shards == 0 {
+        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--data-first requires --send-shards.")));
+    }
     if args.balance_bond.is_some() && args.send_shards == 0 {
         return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "--balance-bond requires --send-shards.")));
     }
@@ -381,6 +391,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
             shards: args.send_shards,
             shard_cores: args.send_cores.clone(),
             shard_spin_us: args.send_spin_us,
+            data_first: args.data_first,
             recv_core: args.recv_core,
             dispatch_core: args.dispatch_core,
             recv_busy_poll_us: args.recv_busy_poll_us,

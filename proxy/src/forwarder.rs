@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
@@ -105,6 +105,11 @@ pub struct SendConfig {
     /// their last batch before sleeping, so in bursts they are never woken;
     /// 0 = sleep at once.
     pub shard_spin_us: u32,
+    /// Send each batch's data shreds before its coding shreds, at a higher
+    /// socket priority (`DATA_PRIORITY`), so that a priority qdisc on the
+    /// NIC ports (`fanout/scripts/prio-qdisc.sh`) puts waiting data shreds
+    /// ahead of waiting coding shreds when the wire is busy.
+    pub data_first: bool,
     /// CPU for the listen threads.
     pub recv_core: Option<usize>,
     /// CPU for the dispatch thread (dedup + hand-off to the senders); pinned,
@@ -623,6 +628,21 @@ fn update_max_atomic(cell: &AtomicU64, val: u64) {
 struct ShardDest {
     addr: SocketAddr,
     socket: UdpSocket,
+    /// Last `SO_PRIORITY` set on `socket` (-1: never), to skip repeats.
+    priority: AtomicI32,
+}
+
+/// Socket priorities with `SendConfig::data_first`: 6 (TC_PRIO_INTERACTIVE)
+/// is the first band of pfifo_fast (and of prio with its default priomap),
+/// 0 the normal band.
+const DATA_PRIORITY: i32 = 6;
+const CODING_PRIORITY: i32 = 0;
+
+/// Whether a packet is a coding shred, from the shred variant byte after
+/// the 64-byte signature (legacy 0x5A; Merkle 0x4_, 0x6_, 0x7_). Anything
+/// else, including what is not a shred, counts as data.
+fn is_coding_shred(data: &[u8]) -> bool {
+    matches!(data.get(64), Some(&v) if v == 0x5A || matches!(v & 0xF0, 0x40 | 0x60 | 0x70))
 }
 
 /// A shard's current destinations, replaced by the shard manager on change.
@@ -655,11 +675,12 @@ fn start_shard_manager_thread(
                 let dests: ShardDests = Arc::new(ArcSwap::from_pointee(Vec::new()));
                 let core = config.shard_cores.get(i).copied();
                 let spin_for = Duration::from_micros(config.shard_spin_us.into());
+                let data_first = config.data_first;
                 let (shard_dests_i, metrics, exit) = (dests.clone(), metrics.clone(), exit.clone());
                 let hdl = Builder::new()
                     .name(format!("ssPxyShard_{i}"))
                     .spawn(move || {
-                        run_send_shard(i, rx, shard_dests_i, core, spin_for, metrics, exit)
+                        run_send_shard(i, rx, shard_dests_i, core, spin_for, data_first, metrics, exit)
                     })
                     .expect("failed to spawn send shard");
                 owned.insert(shard_key(i), tx);
@@ -667,8 +688,8 @@ fn start_shard_manager_thread(
                 shard_dests.push(dests);
             }
             info!(
-                "send shards: {} (cores {:?}; pinned shards busy-poll; others spin {} us before sleeping)",
-                config.shards, config.shard_cores, config.shard_spin_us
+                "send shards: {} (cores {:?}; pinned shards busy-poll; others spin {} us before sleeping; data first: {})",
+                config.shards, config.shard_cores, config.shard_spin_us, config.data_first
             );
 
             let tick = crossbeam_channel::tick(DEST_RECONCILE_INTERVAL);
@@ -730,7 +751,11 @@ fn reshard(desired: &[SocketAddr], shard_dests: &[ShardDests], bond_ports: Optio
                 } else {
                     info!("send shard {}: {addr} from port {sport}", k % n);
                 }
-                per_shard[k % n].push(Arc::new(ShardDest { addr: *addr, socket }));
+                per_shard[k % n].push(Arc::new(ShardDest {
+                    addr: *addr,
+                    socket,
+                    priority: AtomicI32::new(-1),
+                }));
             }
             Err(e) => error!("send shard: no socket for {addr}, not sending to it: {e}"),
         }
@@ -815,9 +840,16 @@ fn run_send_shard(
     dests: ShardDests,
     core: Option<usize>,
     spin_for: Duration,
+    data_first: bool,
     metrics: Arc<ShredMetrics>,
     exit: Arc<AtomicBool>,
 ) {
+    // Per destination: (which shreds, socket priority) per `sendmmsg`.
+    let passes: &[(Option<bool>, Option<i32>)] = if data_first {
+        &[(Some(false), Some(DATA_PRIORITY)), (Some(true), Some(CODING_PRIORITY))]
+    } else {
+        &[(None, None)]
+    };
     if let Some(core) = core {
         pin_current_thread(core);
     }
@@ -862,34 +894,47 @@ fn run_send_shard(
             // SAFETY: `snapshot` keeps `dest` alive past the `scratch.clear()`
             // below, so the 'static lifetime is a phantom that never escapes.
             let addr_static: &'static SocketAddr = unsafe { std::mem::transmute(addr) };
-            for pkt in batch.iter() {
-                if let Some(data) = pkt.data(..) {
-                    // SAFETY: `batch` outlives this loop; `scratch` is cleared
-                    // before the iteration ends.
-                    let data_static: &'static [u8] = unsafe { std::mem::transmute(data) };
-                    scratch.push((data_static, addr_static));
+            for &(coding, priority) in passes {
+                for pkt in batch.iter() {
+                    if let Some(data) = pkt.data(..) {
+                        if coding.is_some_and(|c| c != is_coding_shred(data)) {
+                            continue;
+                        }
+                        // SAFETY: `batch` outlives this loop; `scratch` is cleared
+                        // before the iteration ends.
+                        let data_static: &'static [u8] = unsafe { std::mem::transmute(data) };
+                        scratch.push((data_static, addr_static));
+                    }
                 }
+                if scratch.is_empty() {
+                    continue;
+                }
+                if let Some(p) = priority {
+                    if dest.priority.swap(p, Ordering::Relaxed) != p {
+                        set_priority(&dest.socket, p);
+                    }
+                }
+                let to_send = scratch.len() as u64;
+                match batch_send(&dest.socket, &scratch) {
+                    Ok(()) => {
+                        metrics
+                            .success_forward
+                            .fetch_add(to_send, Ordering::Relaxed);
+                    }
+                    Err(SendPktsError::IoError(err, num_failed)) => {
+                        metrics
+                            .fail_forward
+                            .fetch_add(num_failed as u64, Ordering::Relaxed);
+                        metrics
+                            .success_forward
+                            .fetch_add(to_send.saturating_sub(num_failed as u64), Ordering::Relaxed);
+                        error!(
+                            "send shard {id} to {addr} failed batch of {to_send}: {num_failed} failed. Error: {err}"
+                        );
+                    }
+                }
+                scratch.clear();
             }
-            let to_send = scratch.len() as u64;
-            match batch_send(&dest.socket, &scratch) {
-                Ok(()) => {
-                    metrics
-                        .success_forward
-                        .fetch_add(to_send, Ordering::Relaxed);
-                }
-                Err(SendPktsError::IoError(err, num_failed)) => {
-                    metrics
-                        .fail_forward
-                        .fetch_add(num_failed as u64, Ordering::Relaxed);
-                    metrics
-                        .success_forward
-                        .fetch_add(to_send.saturating_sub(num_failed as u64), Ordering::Relaxed);
-                    error!(
-                        "send shard {id} to {addr} failed batch of {to_send}: {num_failed} failed. Error: {err}"
-                    );
-                }
-            }
-            scratch.clear();
         }
         drop(snapshot);
 
@@ -988,6 +1033,29 @@ fn set_busy_poll(socket: &UdpSocket, usecs: u32) {
         warn!("could not set SO_BUSY_POLL {usecs}: {}", std::io::Error::last_os_error());
     }
 }
+
+/// Sets `SO_PRIORITY`: the priority of the packets sent from now on.
+#[cfg(target_os = "linux")]
+fn set_priority(socket: &UdpSocket, priority: i32) {
+    use std::os::fd::AsRawFd;
+    let v = priority as libc::c_int;
+    // SAFETY: valid fd, option value points to a c_int of the given size.
+    let r = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        warn!("could not set SO_PRIORITY {priority}: {}", std::io::Error::last_os_error());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_priority(_socket: &UdpSocket, _priority: i32) {}
 
 /// Sets the receive buffer to `bytes` with `SO_RCVBUFFORCE` (needs
 /// CAP_NET_ADMIN; not capped by `net.core.rmem_max`).

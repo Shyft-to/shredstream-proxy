@@ -130,6 +130,9 @@ def main():
     print("\nmeasured (copy handed to the NIC driver; excludes its ring)")
     print(f"  last copy   {km.pct(m_last)}")
     print(f"  first copy  {km.pct(m_first)}")
+    m_data = [eg[k][1] - first_ns[k] for k in keys
+              if inwin[sid[k]] and info[k][0] and k in eg and eg[k][2] & live == live]
+    print(f"  data shreds, last copy  {km.pct(m_data)}")
 
     secs = (t1 - t0) / 1e9
     for gbps in (float(g) for g in a.gbps.split(",")):

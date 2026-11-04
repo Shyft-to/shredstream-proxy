@@ -216,6 +216,7 @@ forwarder thread.
 | `--recv-buffer-bytes <n>` | `0` | Receive buffer of each listen socket (`SO_RCVBUFFORCE`); 0 = system default. |
 | `--dedup <bool>` | `true` | `false` skips the proxy's own dedup. Only behind the kernel dedup filter, which is exact; the proxy's probabilistic filter drops ~1 unique shred in 200k (Fra). |
 | `--send-spin-us <us>` | `0` | With `--send-shards`: unpinned senders poll their queue this long after each batch before sleeping; in bursts the dispatch thread then never wakes them. |
+| `--data-first <bool>` | `false` | With `--send-shards`: each batch's data shreds are sent before its coding shreds, at socket priority 6 (coding 0). With `fanout/scripts/prio-qdisc.sh apply` (pfifo_fast per transmit queue), waiting data shreds then go ahead of waiting coding shreds when the wire is busy. |
 | `--balance-bond <dev>` | none | With `--send-shards`: chooses each destination's source port so the bond's layer3+4 hash spreads destinations evenly over its ports (Fra: 15 of 23 were on one 10 Gb/s port). Check the hash with `fanout/scripts/bond-hash-check.py` first. |
 
 ### The end-to-end metric (kept)
