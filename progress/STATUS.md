@@ -61,7 +61,9 @@ spread bursts over CPUs.
    A zero-cost forwarder replayed on real arrivals has p99 1,283 µs; the
    live tuned proxy measures 1,267. 25 Gb/s links: floor p99 ~49 µs.
    Sending data shreds before coding shreds: data-shred p99 213 µs on the
-   same 10 Gb/s links (chapter 7).
+   same 10 Gb/s links (chapter 7). Live: data shreds first (socket
+   priority + pfifo_fast per queue) halves the data-shred p99 (~1 ms →
+   ~490 µs, 3 vs 3), all-shred p99 unchanged.
 1. **Kernel fan-out cuts the tail 7.5×.** One eBPF program on `bond0`
    receive drops duplicate copies and clones each shred directly to all 15
    destinations. Against kernel dedup + 3 proxies (6 vs 6): p99 2.35 →
