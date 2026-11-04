@@ -177,11 +177,12 @@ struct CommonArgs {
     #[arg(long, env, default_value_t = 0)]
     recv_busy_poll_us: u32,
 
-    /// Do not deduplicate in the proxy. Only behind the kernel dedup filter
-    /// (`fanout/scripts/dedup.sh`), which is exact: the proxy's probabilistic
-    /// filter occasionally drops a unique shred.
-    #[arg(long, env, default_value_t = false)]
-    no_dedup: bool,
+    /// Deduplicate in the proxy (`--dedup false` / `DEDUP=false` to skip).
+    /// Skip it only behind the kernel dedup filter (`fanout/scripts/dedup.sh`),
+    /// which is exact: the proxy's probabilistic filter occasionally drops a
+    /// unique shred.
+    #[arg(long, env, default_value_t = true, action = clap::ArgAction::Set)]
+    dedup: bool,
 
     /// Receive buffer of each listen socket, in bytes (`SO_RCVBUFFORCE`, not
     /// capped by `net.core.rmem_max`). 0 = system default.
@@ -384,7 +385,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
             dispatch_core: args.dispatch_core,
             recv_busy_poll_us: args.recv_busy_poll_us,
             recv_buffer_bytes: args.recv_buffer_bytes,
-            skip_dedup: args.no_dedup,
+            skip_dedup: !args.dedup,
             balance_bond: args.balance_bond.clone(),
         },
     );
