@@ -112,6 +112,11 @@ pub struct SendConfig {
     pub dispatch_core: Option<usize>,
     /// `SO_BUSY_POLL` (µs) on the listen sockets; 0 = off.
     pub recv_busy_poll_us: u32,
+    /// Skip the proxy's own (probabilistic) dedup: for use behind the
+    /// kernel dedup filter, which is exact. The proxy's filter wrongly drops
+    /// a unique shred now and then (~1 in 200k on Fra), and behind the kernel
+    /// filter no other forwarder covers for it.
+    pub skip_dedup: bool,
     /// Receive buffer (bytes) of each listen socket, set with
     /// `SO_RCVBUFFORCE` (ignores `net.core.rmem_max`); 0 = system default.
     pub recv_buffer_bytes: usize,
@@ -170,6 +175,9 @@ pub fn start_forwarder_threads(
     }
     let recv_core = send_config.recv_core;
     let dispatch_core = send_config.dispatch_core;
+    if send_config.skip_dedup {
+        info!("proxy dedup off: relying on the kernel dedup filter");
+    }
 
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
@@ -276,7 +284,7 @@ pub fn start_forwarder_threads(
                 pin_thread(&listen_thread, core);
             }
 
-            let deduper = deduper.clone();
+            let deduper = (!send_config.skip_dedup).then(|| deduper.clone());
             let metrics = metrics.clone();
             let shutdown_receiver = shutdown_receiver.clone();
             let reconstruct_tx = reconstruct_tx.clone();
@@ -294,7 +302,7 @@ pub fn start_forwarder_threads(
                                 Ok(packet_batch) => {
                                     if recv_from_channel_and_send_multiple_dest(
                                         Ok(packet_batch),
-                                        &deduper,
+                                        deduper.as_deref(),
                                         &dest_senders,
                                         should_reconstruct_shreds,
                                         &reconstruct_tx,
@@ -317,7 +325,7 @@ pub fn start_forwarder_threads(
                                 recv(packet_receiver) -> maybe_packet_batch => {
                                     let res = recv_from_channel_and_send_multiple_dest(
                                         maybe_packet_batch,
-                                        &deduper,
+                                        deduper.as_deref(),
                                         &dest_senders,
                                         should_reconstruct_shreds,
                                         &reconstruct_tx,
@@ -1082,7 +1090,7 @@ fn set_busy_poll(_socket: &UdpSocket, usecs: u32) {
 #[allow(clippy::too_many_arguments)]
 fn recv_from_channel_and_send_multiple_dest(
     maybe_packet_batch: Result<PacketBatch, RecvError>,
-    deduper: &RwLock<Deduper<2, [u8]>>,
+    deduper: Option<&RwLock<Deduper<2, [u8]>>>,
     dest_senders: &ArcSwap<DestSenderMap>,
     should_reconstruct_shreds: bool,
     reconstruct_tx: &crossbeam_channel::Sender<PacketBatch>,
@@ -1114,10 +1122,12 @@ fn recv_from_channel_and_send_multiple_dest(
     let mut packet_batch_vec = vec![packet_batch];
 
     let t_before_dedup = mark();
-    let num_deduped = solana_perf::deduper::dedup_packets_and_count_discards(
-        &deduper.read().unwrap(),
-        &mut packet_batch_vec,
-    );
+    let num_deduped = deduper.map_or(0, |deduper| {
+        solana_perf::deduper::dedup_packets_and_count_discards(
+            &deduper.read().unwrap(),
+            &mut packet_batch_vec,
+        )
+    });
     let dedup_us = elapsed_us(t_before_dedup);
     metrics
         .duplicate
@@ -1862,7 +1872,7 @@ mod tests {
         let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),
-            &Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
+            Some(&RwLock::new(Deduper::<2, [u8]>::new(
                 &mut rand::thread_rng(),
                 crate::forwarder::DEDUPER_NUM_BITS,
             ))),
