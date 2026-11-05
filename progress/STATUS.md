@@ -64,6 +64,10 @@ spread bursts over CPUs.
    but made geyserbench ~0.4–0.6 ms worse: reverted 2026-11-05 (any k of
    n shreds rebuild a FEC set; chapters 7–8). From chapter 8 on, every
    change is judged by geyserbench too.
+   **At the geyser node (.76), per FEC set (chapter 9): the box adds
+   29 µs at p50, ~10 µs at the node's p99**; the sets' shreds themselves
+   take 1.1 ms (p50) to 9 ms (p99) to reach the box. Forwarding is no
+   longer where the node's latency is.
 1. **Kernel fan-out cuts the tail 7.5×.** One eBPF program on `bond0`
    receive drops duplicate copies and clones each shred directly to all 15
    destinations. Against kernel dedup + 3 proxies (6 vs 6): p99 2.35 →
@@ -168,3 +172,4 @@ spread bursts over CPUs.
 | [6](chapter-06-2026-11-03.md) | 2026-11-03 | Fra rolled back; kfan modelled on real arrivals: one CPU is worse than the proxies (node FEC sets +1.2 ms, matches geyserbench); probe numbers were an artifact |
 | [7](chapter-07-2026-11-04.md) | 2026-11-04 | Fra: one tuned proxy behind kernel dedup with an idle standby (failover drills lost nothing); proxy's own dedup caused ~1 lost shred/min, now off; p50 179 → ~56 µs, p99 2.56 → ~1.24 ms vs baseline; the remaining p99 is the 2 × 10 Gb/s wire (floor model), 25 Gb/s floor p99 ~49 µs |
 | [8](chapter-08-2026-11-05.md) | 2026-11-05 | Data first reverted (geyserbench worse); results named by config and judged by geyserbench; senders spin 200 µs: wake-ups −80% for ~+0.5 core, no geyserbench gain, reverted to 50 µs |
+| [9](chapter-09-2026-11-06.md) | 2026-11-06 | FEC-set readiness at .76 (`fec-ready.py`): box adds 29 µs p50 / 0.9 ms p99 per set; sets' arrival spread 1.1–9 ms dominates; forwarding can't move geyserbench |
