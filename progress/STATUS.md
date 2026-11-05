@@ -53,17 +53,17 @@ spread bursts over CPUs.
 | Region | Status | Baseline (box probe) | With v1 (box probe) |
 |---|---|---|---|
 | Ams (first server) | v1 live since 2026-10-16 | p50 321 µs, p99 5.4 ms, ~8 cores | p50 ~82 µs, p99 ~245 µs, ~0.2 core |
-| Fra | kfan **rolled back 2026-11-03** (adds ~1 ms to geyserbench p50; one CPU too slow on real arrivals). **Live since 2026-11-04:** kernel dedup → one tuned proxy on 23998 (dispatch spinning, senders spin 50 µs, 23 senders on balanced bond ports, proxy dedup off), idle standby on 23999 (chapter 7) | p50 179 µs, p99 2.56 ms, ~2.9 cores | kfan: probe numbers an artifact. Dedup + tuned proxy: **p50 ~56 µs, p99 ~1.24 ms** (5 runs), 0 lost shreds, ~2.5 cores |
+| Fra | kfan **rolled back 2026-11-03** (adds ~1 ms to geyserbench p50; one CPU too slow on real arrivals). **Live since 2026-11-04:** kernel dedup → one tuned proxy on 23998 (dispatch spinning, senders spin 200 µs since 2026-11-05 (was 50), 23 senders on balanced bond ports, proxy dedup off), idle standby on 23999 (chapter 7) | p50 179 µs, p99 2.56 ms, ~2.9 cores | kfan: probe numbers an artifact. Dedup + tuned proxy: **p50 ~56 µs, p99 ~1.24 ms** (5 runs), 0 lost shreds, ~2.5 cores |
 
 ## Key findings
 
 0. **Fra (2026-11-04): on 2 × 10 Gb/s the p99 is the wire, not software.**
    A zero-cost forwarder replayed on real arrivals has p99 1,283 µs; the
    live tuned proxy measures 1,267. 25 Gb/s links: floor p99 ~49 µs.
-   Sending data shreds before coding shreds: data-shred p99 213 µs on the
-   same 10 Gb/s links (chapter 7). Live: data shreds first (socket
-   priority + pfifo_fast per queue) halves the data-shred p99 (~1 ms →
-   ~490 µs, 3 vs 3), all-shred p99 unchanged.
+   Data shreds first halved the probe's data-shred p99 (~1 ms → ~490 µs)
+   but made geyserbench ~0.4–0.6 ms worse: reverted 2026-11-05 (any k of
+   n shreds rebuild a FEC set; chapters 7–8). From chapter 8 on, every
+   change is judged by geyserbench too.
 1. **Kernel fan-out cuts the tail 7.5×.** One eBPF program on `bond0`
    receive drops duplicate copies and clones each shred directly to all 15
    destinations. Against kernel dedup + 3 proxies (6 vs 6): p99 2.35 →
@@ -167,3 +167,4 @@ spread bursts over CPUs.
 | [5](chapter-05-2026-11-02.md) | 2026-11-02 | Fra rollout: survey (31 destinations, 6 dead), baseline p99 2.56 ms, kfan live (up to 32 destinations): p99 373 µs (low end) |
 | [6](chapter-06-2026-11-03.md) | 2026-11-03 | Fra rolled back; kfan modelled on real arrivals: one CPU is worse than the proxies (node FEC sets +1.2 ms, matches geyserbench); probe numbers were an artifact |
 | [7](chapter-07-2026-11-04.md) | 2026-11-04 | Fra: one tuned proxy behind kernel dedup with an idle standby (failover drills lost nothing); proxy's own dedup caused ~1 lost shred/min, now off; p50 179 → ~56 µs, p99 2.56 → ~1.24 ms vs baseline; the remaining p99 is the 2 × 10 Gb/s wire (floor model), 25 Gb/s floor p99 ~49 µs |
+| [8](chapter-08-2026-11-05.md) | 2026-11-05 | Data first reverted (geyserbench worse); results named by config and judged by geyserbench; senders spin 200 µs: wake-ups −80% for ~+0.5 core (geyserbench pending) |
