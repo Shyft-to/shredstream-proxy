@@ -39,8 +39,9 @@ from array import array
 KEY_BYTES = 83  # same shred identity as fanout-measure: signature .. FEC set index
 
 
-def pcap_packets(path):
-    """Yields (ts_ns, flow, src_ip, sport, dst_ip, dport, key, payload_head) per UDP/IPv4 packet."""
+def pcap_packets(path, head_bytes=KEY_BYTES):
+    """Yields (ts_ns, flow, src_ip, sport, dst_ip, dport, key, payload_head) per UDP/IPv4 packet;
+    payload_head is the first head_bytes of the payload (as far as captured)."""
     iface = os.path.basename(path).rsplit("-", 1)[-1].removesuffix(".pcap")
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
         magic = struct.unpack_from("<I", m, 0)[0]
@@ -80,8 +81,8 @@ def pcap_packets(path):
                 continue
             sport, dport, ulen = struct.unpack_from("!HHH", m, l4)
             data = l4 + 8
-            head = m[data:min(stop, data + KEY_BYTES)]
-            key = head + (ulen - 8).to_bytes(2, "big")
+            head = m[data:min(stop, data + head_bytes)]
+            key = head[:KEY_BYTES] + (ulen - 8).to_bytes(2, "big")
             src, dst = bytes(m[off + 12:off + 16]), bytes(m[off + 16:off + 20])
             yield sec * 1_000_000_000 + sub * frac, (iface, src, sport, dport), src, sport, dst, dport, key, head
 
