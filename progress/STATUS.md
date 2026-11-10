@@ -173,3 +173,4 @@ spread bursts over CPUs.
 | [7](chapter-07-2026-11-04.md) | 2026-11-04 | Fra: one tuned proxy behind kernel dedup with an idle standby (failover drills lost nothing); proxy's own dedup caused ~1 lost shred/min, now off; p50 179 → ~56 µs, p99 2.56 → ~1.24 ms vs baseline; the remaining p99 is the 2 × 10 Gb/s wire (floor model), 25 Gb/s floor p99 ~49 µs |
 | [8](chapter-08-2026-11-05.md) | 2026-11-05 | Data first reverted (geyserbench worse); results named by config and judged by geyserbench; senders spin 200 µs: wake-ups −80% for ~+0.5 core, no geyserbench gain, reverted to 50 µs |
 | [9](chapter-09-2026-11-06.md) | 2026-11-06 | FEC-set readiness at .76 (`fec-ready.py`): box adds 29 µs p50 / 0.9 ms p99 per set; sets' arrival spread 1.1–9 ms dominates; forwarding can't move geyserbench |
+| [10](chapter-10-2026-11-10.md) | 2026-11-10 | kfan running again on Fra (operator, 10:22 UTC); geyserbench ~1 ms worse, as in chapter 6 |
