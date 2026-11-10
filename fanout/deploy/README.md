@@ -88,6 +88,8 @@ result.
 | `/etc/shred-fanout/kfan.env` | ports, destinations, options |
 | `/opt/shred-fanout/` | installed `kfan.sh` and `kfan.bpf.c` (built at start) |
 | `shred-kfan.service` | attaches, keeps MACs / bond ports current, logs counters every 60 s |
+| `/etc/shred-fanout/dedup.env` | dedup: ports, `TO_PORT`, `STANDBY_PORT` |
+| `shred-dedup.service` | kernel dedup only (the proxies fan out); logs counters every 60 s |
 
 ## Operate
 
@@ -97,6 +99,25 @@ sudo journalctl -u shred-kfan -f                 # counters every 60 s; WARNING 
 sudo /opt/shred-fanout/scripts/kfan.sh status    # totals, copies per CPU
 sudo systemctl stop shred-kfan                   # roll back: proxies forward again at once
 ```
+
+### Dedup instead of kfan (`shred-dedup`)
+
+Kernel dedup in front of the proxies: later copies of each shred are
+dropped, every first copy goes to `TO_PORT` (the tuned proxy), or to
+`STANDBY_PORT` while nothing listens on `TO_PORT`. Same tc hook as kfan, so
+the units conflict: starting one stops the other first.
+
+```bash
+sudo systemctl start shred-dedup                 # stops shred-kfan if it runs
+sudo journalctl -u shred-dedup -f                # first= dup= moved= no_forwarder= standby= per 60 s
+sudo /opt/shred-fanout/scripts/dedup.sh status   # totals
+sudo systemctl stop shred-dedup                  # every proxy forwards its own copies again
+sudo systemctl enable shred-dedup                # at boot; disable shred-kfan (enable only one)
+```
+
+Each start attaches a fresh filter with an empty table: for a few seconds
+later copies of already-sent shreds count as first and go out again (a
+one-off burst of repeats downstream).
 
 Healthy log line: `first=+N dup=+M sent=+15·N refused=+0 no_dests=+0 error=+0`.
 A `WARNING` line means copies are being refused (`refused`), shreds are going

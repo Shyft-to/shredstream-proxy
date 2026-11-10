@@ -443,9 +443,11 @@ refresh() {
 }
 
 detach() {
-    if attached; then
+    if ours; then
         tc filter del dev "$DEV" ingress pref "$PREF"
         echo "detached from $DEV"
+    elif attached; then
+        echo "another filter (dedup?) holds pref $PREF on $DEV; left in place"
     else
         echo "not attached"
     fi

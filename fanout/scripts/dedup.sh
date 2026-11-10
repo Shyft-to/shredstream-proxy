@@ -10,8 +10,12 @@
 #   dedup.sh detach           remove the filter (instant, no restart of anything)
 #   dedup.sh status           attached or not, and the counters
 #   dedup.sh cost [SECONDS]   measured kernel CPU time per packet (default 10 s)
+#   dedup.sh run PORTS        for a service: (re)attach, log the counters every LOG_S
+#                             (60) seconds; detaches on SIGTERM
 #
-# Settings (environment): DEV (bond0)
+# Shares tc priority 7700 with kfan.sh: only one of the two can be attached;
+# detach only removes this filter, never kfan's.
+# Settings (environment): DEV (bond0), TO_PORT, STANDBY_PORT, LOG_S (60)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,6 +25,7 @@ DEV=${DEV:-bond0}
 PREF=7700 # tc filter priority that identifies our filter
 
 attached() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -q "pref $PREF "; }
+ours() { tc filter show dev "$DEV" ingress 2>/dev/null | grep -A1 "pref $PREF " | grep -q dedup; }
 
 build() {
     local ports=$1 defs=() names=(A B C D) i=0 p
@@ -55,12 +60,58 @@ attach() {
 }
 
 detach() {
-    if attached; then
+    if ours; then
         tc filter del dev "$DEV" ingress pref "$PREF"
         echo "detached from $DEV"
+    elif attached; then
+        echo "another filter (kfan?) holds pref $PREF on $DEV; left in place"
     else
         echo "not attached"
     fi
+}
+
+# One line of counters with the change since the previous call (for the logs).
+log_counters() {
+    bpftool -j map dump name dedup_stats 2>/dev/null | python3 -c '
+import json, sys
+names = ["first", "dup", "short", "error", "moved", "no_forwarder", "standby"]
+def num(v):
+    return v if isinstance(v, int) else int.from_bytes(bytes(int(b, 16) for b in v), "little")
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    sys.exit("counters unavailable")
+tot = {}
+for r in rows:
+    r = r.get("formatted", r)
+    tot[names[num(r["key"])]] = sum(num(v["value"]) for v in r["values"])
+prev_file = "/run/fanout-dedup.counters"
+try:
+    prev = json.load(open(prev_file))
+except (OSError, ValueError):
+    prev = {}
+json.dump(tot, open(prev_file, "w"))
+print(" ".join(f"{n}=+{tot.get(n, 0) - prev.get(n, 0)}" for n in names))
+'
+}
+
+# Service mode: always attach a freshly built program (so config changes take
+# effect on restart), then log the counters until stopped.
+run() {
+    [ $# -eq 1 ] || { echo "usage: dedup.sh run PORTS" >&2; exit 1; }
+    if ours; then
+        echo "replacing the attached dedup program"
+        tc filter del dev "$DEV" ingress pref "$PREF"
+    fi
+    attach "$1"
+    rm -f /run/fanout-dedup.counters
+    trap 'echo "stopping"; detach; exit 0' TERM INT
+    log_counters >/dev/null || true
+    while true; do
+        sleep "${LOG_S:-60}" &
+        wait $!
+        echo "$(date -u +%H:%M:%S) $(log_counters || true)"
+    done
 }
 
 counters() {
@@ -117,5 +168,6 @@ case "${1:-}" in
     detach) detach ;;
     status) status ;;
     cost) shift; cost "$@" ;;
-    *) sed -n '2,13p' "$0"; exit 1 ;;
+    run) shift; run "$@" ;;
+    *) sed -n '2,18p' "$0"; exit 1 ;;
 esac
