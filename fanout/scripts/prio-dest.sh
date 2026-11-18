@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Experiment: send one destination's copies ahead of everything else when the
+# Experiment: send some destinations' copies ahead of everything else when the
 # NIC's transmit queues have a backlog. No proxy change, no restart:
 #   - an nftables table of its own (inet shred_prio) sets socket priority 6 on
-#     outgoing UDP to the destination (other tables and rules untouched);
+#     outgoing UDP to the destinations (other tables and rules untouched);
 #   - prio-qdisc.sh puts pfifo_fast on the bond's transmit queues, which
 #     sends priority 6 (its first band) before priority 0 (everything else).
 # Only reorders packets waiting in the same transmit queue; packets already
 # handed to the NIC go out in order. Run as root.
 #
 # Usage:
-#   prio-dest.sh on IP:PORT    e.g. prio-dest.sh on 10.182.192.76:8002
-#   prio-dest.sh off           remove the rule and restore the default queueing
-#   prio-dest.sh status        rule (with packet count) and queueing
+#   prio-dest.sh on DEST...    DEST = IP:PORT, or IP for all its UDP ports;
+#                              replaces any earlier list, e.g.
+#                              prio-dest.sh on 10.182.192.76:8002 10.182.192.45
+#   prio-dest.sh off           remove the rules and restore the default queueing
+#   prio-dest.sh status        rules (with packet counts) and queueing
 #
 # Settings (environment): BOND (bond0)
 set -euo pipefail
@@ -20,21 +22,26 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 TABLE="inet shred_prio"
 
 on() {
-    local dest=$1 ip port
-    ip=${dest%:*}
-    port=${dest#*:}
-    [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ && "$port" =~ ^[0-9]+$ ]] || { echo "usage: prio-dest.sh on IP:PORT" >&2; exit 1; }
+    local dest rules=""
+    for dest in "$@"; do
+        if [[ "$dest" =~ ^([0-9]+(\.[0-9]+){3}):([0-9]+)$ ]]; then
+            rules+="        ip daddr ${BASH_REMATCH[1]} udp dport ${BASH_REMATCH[3]} counter meta priority set 0:6"$'\n'
+        elif [[ "$dest" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+            rules+="        ip daddr $dest meta l4proto udp counter meta priority set 0:6"$'\n'
+        else
+            echo "not IP or IP:PORT: $dest" >&2; exit 1
+        fi
+    done
     "$DIR/prio-qdisc.sh" apply
     nft delete table $TABLE 2>/dev/null || true
     nft -f - <<EOF
 table $TABLE {
     chain out {
         type filter hook output priority mangle; policy accept;
-        ip daddr $ip udp dport $port counter meta priority set 0:6
-    }
+$rules    }
 }
 EOF
-    echo "copies to $ip:$port now go first in their transmit queue"
+    echo "copies to $* now go first in their transmit queue"
 }
 
 off() {
@@ -48,8 +55,8 @@ status() {
 }
 
 case "${1:-}" in
-    on) shift; [ $# -eq 1 ] || { echo "usage: prio-dest.sh on IP:PORT" >&2; exit 1; }; on "$1" ;;
+    on) shift; [ $# -ge 1 ] || { echo "usage: prio-dest.sh on DEST..." >&2; exit 1; }; on "$@" ;;
     off) off ;;
     status) status ;;
-    *) sed -n '2,17p' "$0"; exit 1 ;;
+    *) sed -n '2,19p' "$0"; exit 1 ;;
 esac
